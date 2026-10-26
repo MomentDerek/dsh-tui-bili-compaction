@@ -210,15 +210,20 @@ test('disableNativeCompaction patches the live preset compaction service', async
     const created = listeners.get('agent/created')
     assert.equal(typeof created, 'function')
     await created({ agent: { session }, source: 'fresh' })
-    assert.equal(await service.compactIfNeeded(), null)
-    assert.equal(pruner.pruneContent(), null)
-    assert.deepEqual(pruner.pruneSession(), { pruned: [], charsRemoved: 0 })
+    // Pressure compaction belongs to this engine; overflow recovery must still
+    // reach the native implementation.
+    assert.equal(await service.compactIfNeeded({}, 'pressure', undefined), null)
+    assert.equal(await service.compactIfNeeded({}, 'context-overflow', undefined), 'original-auto')
+    // The pruner stays untouched so overflow recovery can shrink tool results.
+    assert.deepEqual(pruner.pruneContent(), ['original-content'])
+    assert.equal(pruner.pruneSession(), 'original-session')
 
     const step = listeners.get('agent/pre-step')
     assert.equal(typeof step, 'function')
     await step({ agent: { session } }, async () => ({ kind: 'enter', messages: [] }))
 
-    assert.equal(await service.compactIfNeeded(), null)
+    assert.equal(await service.compactIfNeeded({}, 'pressure', undefined), null)
+    assert.equal(await service.compactIfNeeded({}, 'context-overflow', undefined), 'original-auto')
     await assert.rejects(service.compactNow, (error) => {
       assert.equal(error.name, 'ManualCompactionError')
       assert.equal(error.code, 'cancelled')
@@ -272,7 +277,8 @@ test('native guard falls back to the agent preset context', async () => {
       },
     }
     await listeners.get('agent/created')({ agent, source: 'fresh' })
-    assert.equal(await service.compactIfNeeded(), null)
+    assert.equal(await service.compactIfNeeded({}, 'pressure', undefined), null)
+    assert.equal(await service.compactIfNeeded({}, 'context-overflow', undefined), 'original-auto')
 
     for (const cleanup of cleanups) cleanup?.()
     assert.equal(service.compactIfNeeded(), 'original-auto')

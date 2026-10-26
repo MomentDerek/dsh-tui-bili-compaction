@@ -39,7 +39,7 @@ dsh 的 model-visible surface 本身是一次折叠。如果内核也只看 surf
 
 | 文件 | 职责 |
 | --- | --- |
-| `src/index.ts` | 插件入口（`name = 'bili-compaction'`）；原生压缩守卫（patch preset 内 `compaction` / `toolResultPruner` 服务）；注册工具 |
+| `src/index.ts` | 插件入口（`name = 'bili-compaction'`）；原生压缩守卫（patch preset 内 `compaction` 服务）；注册工具 |
 | `src/session-view.ts` | dsh 日志 → `CoreMessage[]`（append-origin、`ledgerSeq`、保护集） |
 | `src/engine.ts` | `refresh` / `compress` / `decompress` / `status`：内核状态与 durable replace 的桥 |
 | `src/tools.ts` | `compress` / `decompress` / `acp_status` 三个 dsh 工具（schema 直接复用内核常量） |
@@ -55,7 +55,7 @@ dsh 的 model-visible surface 本身是一次折叠。如果内核也只看 surf
 - id: bili-compaction
   config:
     modelContextLimit: 1000000   # 可选：显式钉死窗口；省略时优先用 dsh 会话通告的窗口，最终回退 1M
-    disableNativeCompaction: true # 默认 true：patch 预设内 compaction 服务的 compactIfNeeded / compactNow
+    disableNativeCompaction: true # 默认 true：拦掉预设内 compaction 的“主动压力压缩”与手写 /compact，保留溢出恢复
     storageDir: null             # 默认 LOCALAPPDATA 下的插件状态目录
     languagePreservation: false  # 摘要保留原文语言
     injectNudge: false           # 见下
@@ -66,11 +66,13 @@ dsh 的 model-visible surface 本身是一次折叠。如果内核也只看 surf
 
 ## 原生压缩守卫
 
-dsh-tui 0.14.x 把 `standard` / `ptc` / `cordis` 预设挂成内存里的 `PresetTree`，预设中的 `compaction-basic` 行不经过宿主 Loader，所以 `internal/config` 里的“按 name 禁用行”根本看不到它们。插件改为在 `agent/created`（以及 `agent/pre-step` 兜底）拿到该 agent 预设的 `compaction` 服务，patch 掉 `compactIfNeeded` / `compactNow`：
+dsh-tui 0.14.x 把 `standard` / `ptc` / `cordis` 预设挂成内存里的 `PresetTree`，预设中的 `compaction-basic` 行不经过宿主 Loader，所以 `internal/config` 里的“按 name 禁用行”根本看不到它们。插件改为在 `agent/created`（以及 `agent/pre-step` 兜底）拿到该 agent 预设的 `compaction` 服务，patch 掉两个入口：
 
-- 自动压缩返回 `null`，不会在插件背后再折一次 surface；
-- 手写 `/compact` 抛一个真正的 `ManualCompactionError`（`code: 'cancelled'`，错误类从 profile 的 `@deepseek-ai/dsh-compaction` 解析；解析不到时退化为同名同 `code` 的 `Error`），`/compact` 会显示 “Compaction cancelled.”，而不是两套压缩同时写 `compaction/summary`；
-- 同一个预设里的 `toolResultPruner` 也会被 patch：`pruneContent` 返回 `null`、`pruneSession` 返回空结果，防止重新启用剪枝的构建绕过守卫改写 surface。
+- **主动压力压缩**（`compactIfNeeded(agent, 'pressure')`）返回 `null`：正常推进时只由本插件的 `compress` 折 surface；
+- **溢出恢复**（`compactIfNeeded(agent, 'context-overflow')`）**原样委派给原生实现**。它是会话已经越过模型窗口时唯一的救命通道：原生实现会先让 `toolResultPruner` 把超大工具结果剪短（不调用模型），再按需摘要，然后让请求重试。早期版本把这条路径一起掐掉，结果是一个本可恢复的溢出直接变成裸的 provider 400（`maximum context length is N tokens`），会话再也进不去；
+- **手写 `/compact`**（`compactNow`）抛一个真正的 `ManualCompactionError`（`code: 'cancelled'`，错误类从 profile 的 `@deepseek-ai/dsh-compaction` 解析；解析不到时退化为同名同 `code` 的 `Error`），`/compact` 会显示 “Compaction cancelled.”，而不是两套压缩同时写 `compaction/summary`。
+
+`toolResultPruner` 本身**不再被 patch**：它只在压缩真正运行时才动手，保留它才能让上面的溢出恢复把超大会话拉回窗口内。
 
 如果宿主没有 `agentPresets` 服务（例如精简 profile），插件会尝试从该 agent 自己的 preset context 读取 `compaction` 服务；两者都拿不到时才打一条 warning 并保持原生压缩不动——此时应把 `disableNativeCompaction` 设为 `false`，或自行确认只保留一套压缩。`minimal` 预设本身不带 compaction 服务，不会触发这条路径。
 
@@ -98,6 +100,23 @@ dsh plugin --profile dsh-tui add link:<克隆目录>
 安装前可以用 `/plugins check <克隆目录>/dsh-plugin.json` 验证清单。包同时自带 `cordis.patch.yml`（`dsh.bundle.patch`），loader 会插入 `bili-compaction` 行；装完重启 dsh-tui。
 
 和 `billion-context` 同时装着也能跑，但两者都会压缩：要交给本插件，就把 `billion-context` 从 `dsh.profile.bundles` 里去掉（或至少让它的 `dsh-native` 不接管）。
+
+## 救援一个已经超窗的会话
+
+如果某个会话在换插件前就已经超过模型窗口（`dsh-tui --resume` 直接报 `maximum context length is … tokens`），它进不了任何 pre-step 钩子，插件也没有机会插手。`scripts/rescue-session.mjs` 是一次性的离线救援工具：给日志末尾追加**一条** durable `surfaceOp: 'replace'`，把最老的一段消息换成一份离线摘要，保留最近若干轮原文。
+
+```powershell
+# 1) 读日志、算折叠点（保留约 160 万字符），并导出旧消息的叙事文本
+node scripts/rescue-plan.mjs <sessionId> tmp-rescue
+# 2) 把 tmp-rescue/narrative.txt 总结成 tmp-rescue/summary.md（这一步可以交给另一个模型/人）
+# 3) 干跑，再用 dsh 自己的 foldSurface 验一遍
+node scripts/rescue-session.mjs <sessionId> tmp-rescue/plan.json tmp-rescue/summary.md
+node scripts/rescue-validate.mjs <session.jsonl.zstd> tmp-rescue/plan.json tmp-rescue/summary.md
+# 4) 备份原日志后真正写入
+node scripts/rescue-session.mjs <sessionId> tmp-rescue/plan.json tmp-rescue/summary.md --apply
+```
+
+写入前会把原日志复制成 `*.bak-<时间戳>`；写入后 `foldSurface` 校验通过、token 估算落回窗口内，才建议重启 dsh-tui 继续该会话。跑过这一步之后，插件守卫里的“溢出恢复委派”会接管后续增长。
 
 ## 开发
 
@@ -136,5 +155,5 @@ npm test                    # node --test tests/*.test.mjs
 
 ## 验证状态
 
-- `npm test`：17 个用例，覆盖 store 归一化/损坏回退、原生压缩行剥离与 preset 服务守卫（compaction + toolResultPruner）、`ManualCompactionError` 解析、preset context 兜底、append-origin 视图与 ref 编号、durable replace 提交、未知 ref 拒绝、多 block 事件的半覆盖拒绝、失败提交不落 active block、显式 compress 不吃保护尾、动态窗口识别、只读状态不推进 nudge、reset 不重用 block id、`acp_status` 隐藏已被 surface 折掉的区间，以及「给出的 ref 必须能被 `compress` 当场接受」的回归。
+- `npm test`：17 个用例，覆盖 store 归一化/损坏回退、原生压缩行剥离与 preset 服务守卫（压力压缩返回 `null`、溢出恢复委派原生实现、`toolResultPruner` 不被改写）、`ManualCompactionError` 解析、preset context 兜底、append-origin 视图与 ref 编号、durable replace 提交、未知 ref 拒绝、多 block 事件的半覆盖拒绝、失败提交不落 active block、显式 compress 不吃保护尾、动态窗口识别、只读状态不推进 nudge、reset 不重用 block id、`acp_status` 隐藏已被 surface 折掉的区间，以及「给出的 ref 必须能被 `compress` 当场接受」的回归。
 - 真实 dsh 会话（headless profile，`preserveRecentMessages: 0`）：`acp_status` → `compress` 一次成功，dsh 日志落下 `surfaceOp: 'replace'`，token meter 随之下降；插件状态文件里出现 `b1 m00009–m00017 3374 tokens`。

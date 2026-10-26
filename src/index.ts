@@ -312,7 +312,9 @@ function installNativeCompactionGuard(ctx: PluginContext): NativeCompactionGuard
   const patchService = (
     agent: DshAgentLike,
     name: string,
-    replacements: Readonly<Record<string, (...args: unknown[]) => unknown>>,
+    replacements: Readonly<
+      Record<string, (original: (...args: unknown[]) => unknown) => (...args: unknown[]) => unknown>
+    >,
   ): void => {
     const service = resolveService(agent, name)
     if (service === undefined) {
@@ -325,11 +327,11 @@ function installNativeCompactionGuard(ctx: PluginContext): NativeCompactionGuard
     if (typeof service !== 'object' || service === null || patched.has(service)) return
     patched.add(service)
     const target = service as Record<string, unknown>
-    for (const [method, replacement] of Object.entries(replacements)) {
+    for (const [method, make] of Object.entries(replacements)) {
       if (typeof target[method] !== 'function') continue
-      const original = target[method]
+      const original = target[method] as (...args: unknown[]) => unknown
       try {
-        target[method] = replacement
+        target[method] = make(original)
         restores.push({ target, method, original })
       } catch {
         if (!warned) {
@@ -342,8 +344,18 @@ function installNativeCompactionGuard(ctx: PluginContext): NativeCompactionGuard
 
   const patch = (agent: DshAgentLike): void => {
     patchService(agent, 'compaction', {
-      compactIfNeeded: async (): Promise<null> => null,
-      compactNow: async (): Promise<never> => {
+      // Context-overflow recovery is the only path that can rescue a session
+      // that is already past the model window, and it prunes oversized tool
+      // results before summarizing. Suppressing it turns a recoverable
+      // overflow into a raw provider 400, so that trigger always delegates.
+      compactIfNeeded: (original) => async (...args: unknown[]): Promise<unknown> => {
+        const trigger = args[1]
+        if (trigger === 'context-overflow') return original(...args)
+        return null
+      },
+      // Manual `/compact` stays redirected: two systems writing summary
+      // checkpoints from one keystroke is never what the operator meant.
+      compactNow: () => async (): Promise<never> => {
         const ctor = await loadManualCompactionError(agent, ctx)
         throw disabledCompactionError(
           ctor,
@@ -351,13 +363,10 @@ function installNativeCompactionGuard(ctx: PluginContext): NativeCompactionGuard
         )
       },
     })
-    // The pruner writes its own durable surface replacements. It is currently
-    // disabled inside dsh-compaction-basic, but guard it defensively so a build
-    // that re-enables pruning cannot mutate the surface behind this engine.
-    patchService(agent, 'toolResultPruner', {
-      pruneContent: (): null => null,
-      pruneSession: (): { pruned: never[]; charsRemoved: number } => ({ pruned: [], charsRemoved: 0 }),
-    })
+    // `toolResultPruner` is deliberately left untouched: it only runs when
+    // compaction runs, and its prune-before-summarize pass is what lets the
+    // overflow path above bring an over-window session back under the limit
+    // without a model call.
   }
 
   return {

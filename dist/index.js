@@ -266,12 +266,12 @@ function installNativeCompactionGuard(ctx) {
             return;
         patched.add(service);
         const target = service;
-        for (const [method, replacement] of Object.entries(replacements)) {
+        for (const [method, make] of Object.entries(replacements)) {
             if (typeof target[method] !== 'function')
                 continue;
             const original = target[method];
             try {
-                target[method] = replacement;
+                target[method] = make(original);
                 restores.push({ target, method, original });
             }
             catch {
@@ -284,19 +284,27 @@ function installNativeCompactionGuard(ctx) {
     };
     const patch = (agent) => {
         patchService(agent, 'compaction', {
-            compactIfNeeded: async () => null,
-            compactNow: async () => {
+            // Context-overflow recovery is the only path that can rescue a session
+            // that is already past the model window, and it prunes oversized tool
+            // results before summarizing. Suppressing it turns a recoverable
+            // overflow into a raw provider 400, so that trigger always delegates.
+            compactIfNeeded: (original) => async (...args) => {
+                const trigger = args[1];
+                if (trigger === 'context-overflow')
+                    return original(...args);
+                return null;
+            },
+            // Manual `/compact` stays redirected: two systems writing summary
+            // checkpoints from one keystroke is never what the operator meant.
+            compactNow: () => async () => {
                 const ctor = await loadManualCompactionError(agent, ctx);
                 throw disabledCompactionError(ctor, 'native compaction is disabled by bili-compaction; use the compress tool instead');
             },
         });
-        // The pruner writes its own durable surface replacements. It is currently
-        // disabled inside dsh-compaction-basic, but guard it defensively so a build
-        // that re-enables pruning cannot mutate the surface behind this engine.
-        patchService(agent, 'toolResultPruner', {
-            pruneContent: () => null,
-            pruneSession: () => ({ pruned: [], charsRemoved: 0 }),
-        });
+        // `toolResultPruner` is deliberately left untouched: it only runs when
+        // compaction runs, and its prune-before-summarize pass is what lets the
+        // overflow path above bring an over-window session back under the limit
+        // without a model call.
     };
     return {
         patch,
