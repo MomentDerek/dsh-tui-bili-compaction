@@ -88,6 +88,21 @@ dsh-tui 0.14.x 把 `standard` / `ptc` / `cordis` 预设挂成内存里的 `Prese
 
 dsh 的 `agent/pre-step` 没有“临时消息”通道：listener 返回的任何消息都会被 `agent-loop` 追加进 durable log。所以内核的 nudge 默认不写进会话，模型通过 `acp_status` 拿到同样的信息（当前用量、可压区间、活跃 block）——一次工具调用，零日志污染。把 `injectNudge` 打开才会在每一步追加一条 `source.kind = 'bili-compaction-nudge'` 的 user 消息。
 
+**不注入时插件不会自己压缩**：内核只“建议”折叠，真正的 `compress` 由模型发起（或 dsh 原生在压力/溢出时动手）。所以如果希望它在使用量到达某个比例时自动催着模型压缩，就要同时打开 `injectNudge` 并调低 nudge 曲线：
+
+```yaml
+- id: bili-compaction
+  config:
+    injectNudge: true
+    kernel:
+      nudge:
+        minContextLimitPct: 0.2      # 默认 0.45：越过 20% 就开始提醒
+        maxContextLimitPct: 0.6      # 默认 0.75
+        emergencyThresholdPct: 0.85  # 默认 0.95
+```
+
+未被投递的 nudge 不会推进内核的“已提醒”水位（`advanceNudge: false`），所以关掉 `injectNudge` 期间错过的提醒会在重新打开后立刻补上，而不是被静默吞掉。
+
 ## 安装
 
 插件以 dsh-tui Community v0.15 插件形式发布：仓库根目录带 `dsh-plugin.json`，`facets.host.entry` 指向已提交的 `dist/index.js`，因此从 GitHub 克隆后不需要再构建：

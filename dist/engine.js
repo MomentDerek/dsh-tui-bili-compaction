@@ -125,9 +125,14 @@ export class CompactionEngine {
     /**
      * Fold the current log into the kernel and persist the resulting state.
      * Returns the kernel's nudge decision for this step (if any).
+     *
+     * `advanceNudge` must stay false when the caller will not deliver the nudge
+     * to the model: the kernel's watermark means "the model has been told", so
+     * advancing it without delivering swallows the compression prompt and the
+     * next real nudge never looks new.
      */
-    refresh(session, measurement) {
-        const synced = this.sync(session, measurement);
+    refresh(session, measurement, options = {}) {
+        const synced = this.sync(session, measurement, options);
         return { decision: synced.decision, tokenCount: synced.tokenCount };
     }
     /**

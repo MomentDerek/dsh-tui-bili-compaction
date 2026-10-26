@@ -711,6 +711,37 @@ test('a session-advertised window replaces the static default', () => {
   }
 })
 
+test('a suppressed nudge does not advance the watermark', () => {
+  const dir = temporaryDir()
+  try {
+    const session = new FakeSession()
+    session.push(userMessage('u1', filler(6000)))
+    session.push(assistantMessage('a1', filler(6000)))
+    session.push(userMessage('u2', filler(6000)))
+    session.push(assistantMessage('a2', filler(6000)))
+    session.push(userMessage('u3', 'young tail'))
+
+    const options = resolveOptions({
+      storageDir: dir,
+      modelContextLimit: 40_000,
+      kernel: { preserveRecentMessages: 0, preserveRecentTokens: 0 },
+    })
+    const store = new SessionStore(dir)
+    const engine = new CompactionEngine(options, store)
+    // The plugin's pre-step passes advanceNudge:false whenever it will not
+    // deliver the nudge, so an undelivered prompt has to stay pending.
+    const refreshed = engine.refresh(
+      session,
+      { totalTokens: 30_000, surfaceTokens: 30_000, nodes: [] },
+      { advanceNudge: false },
+    )
+    assert.equal(refreshed.decision?.shouldInject, true)
+    assert.equal(store.load(session.id).state.nudge.lastNudgeShownTokens, 0)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('read-only status does not consume the nudge watermark', () => {
   const dir = temporaryDir()
   try {

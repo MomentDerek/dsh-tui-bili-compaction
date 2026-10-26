@@ -339,7 +339,10 @@ function installStepHook(ctx, engine, injectNudge, getMeter, nativeGuard) {
         if (agent !== undefined)
             nativeGuard?.patch(agent);
         const measurement = getMeter()?.measure(session);
-        const refreshed = engine.refresh(session, measurement);
+        // Only advance the kernel's "already told the model" watermark when the
+        // nudge is actually delivered below; otherwise a silent pre-step would eat
+        // the nudge and compression would never be suggested.
+        const refreshed = engine.refresh(session, measurement, { advanceNudge: injectNudge });
         if (!injectNudge)
             return decision;
         const text = engine.nudgeText(refreshed.decision);
