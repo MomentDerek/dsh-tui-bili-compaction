@@ -19,34 +19,65 @@ function textOfBlocks(blocks) {
 function contentLength(message) {
     return textOfBlocks(message.content).length;
 }
+/**
+ * Injected context that only looks like a user message: keeping these in the
+ * digest wastes the budget on clock stamps and registry notices a resumed
+ * reader cannot use.
+ */
+const DIGEST_NOISE_SOURCES = new Set([
+    'time-context',
+    'runtime-context',
+    'tool-registry',
+    'skill-catalog',
+    'system-prompt',
+    'bili-compaction-nudge',
+]);
 function digestMessages(messages) {
     const lines = [];
+    let pendingTools = new Map();
+    const flushTools = () => {
+        if (pendingTools.size === 0)
+            return;
+        const parts = [...pendingTools.entries()]
+            .sort((left, right) => right[1] - left[1])
+            .map(([name, count]) => `${name}×${count}`);
+        lines.push(`- 工具序列：${parts.join(' · ')}`);
+        pendingTools = new Map();
+    };
     for (const message of messages) {
+        const kind = typeof message.source?.kind === 'string' ? message.source.kind : '';
+        if (DIGEST_NOISE_SOURCES.has(kind))
+            continue;
         const role = String(message.role);
+        const text = textOfBlocks(message.content).trim();
         if (role === 'user') {
-            const text = textOfBlocks(message.content).trim();
+            flushTools();
             if (text.length > 0)
                 lines.push(`- 用户：${text.slice(0, 800)}`);
             continue;
         }
         if (role !== 'assistant')
             continue;
-        const parts = [];
+        const toolNames = [];
         for (const block of message.content) {
-            const kind = String(block.type);
-            if (kind === 'text') {
-                const text = block.text ?? '';
-                if (text.trim().length > 0)
-                    parts.push(text.trim().slice(0, 260));
-            }
-            else if (kind === 'tool-call') {
-                const name = block.name;
-                parts.push(`[${typeof name === 'string' ? name : 'tool'}]`);
-            }
+            if (String(block.type) !== 'tool-call')
+                continue;
+            const name = block.name;
+            toolNames.push(typeof name === 'string' ? name : 'tool');
         }
-        if (parts.length > 0)
-            lines.push(`- 助手：${parts.join(' ').slice(0, 320)}`);
+        if (text.length > 0) {
+            flushTools();
+            const tail = toolNames.length === 0 ? '' : ` ${toolNames.map((name) => `[${name}]`).join('')}`;
+            lines.push(`- 助手：${`${text}${tail}`.slice(0, 320)}`);
+        }
+        else {
+            // A step that only ran tools says nothing written down; summarize the
+            // run instead of spending a line per call on `[pwsh]`.
+            for (const name of toolNames)
+                pendingTools.set(name, (pendingTools.get(name) ?? 0) + 1);
+        }
     }
+    flushTools();
     if (lines.length === 0)
         return '(no summarizable text in this range)';
     const body = lines.join('\n');

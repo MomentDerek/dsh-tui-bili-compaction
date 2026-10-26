@@ -746,6 +746,23 @@ test('autoFold condenses the oldest visible messages without a model call', () =
   const dir = temporaryDir()
   try {
     const session = new FakeSession()
+    // Injected clock stamps must not consume digest budget.
+    session.push({
+      id: 'noise',
+      role: 'user',
+      content: [{ type: 'text', text: 'Time sampled while preparing turn 1: 2026-01-01T00:00:00+08:00' }],
+      source: { kind: 'time-context' },
+    })
+    // Tool-only steps collapse into one run line instead of one line per call.
+    session.push({
+      id: 'tools',
+      role: 'assistant',
+      content: [
+        { type: 'tool-call', name: 'pwsh', arguments: '{}' },
+        { type: 'tool-call', name: 'read', arguments: '{}' },
+      ],
+      source: { kind: 'model' },
+    })
     for (let index = 0; index < 16; index += 1) {
       session.push(index % 2 === 0 ? userMessage(`u${index}`, filler(3000)) : assistantMessage(`a${index}`, filler(3000)))
     }
@@ -768,6 +785,8 @@ test('autoFold condenses the oldest visible messages without a model call', () =
     const text = replacement.data.content.map((block) => block.text).join('\n')
     assert.match(text, /written automatically by bili-compaction/)
     assert.match(text, /<compacted-summary>/)
+    assert.equal(text.includes('Time sampled'), false, 'clock stamps are noise')
+    assert.match(text, /- 工具序列：pwsh×1 · read×1/)
 
     // The retained tail is too small to fold again with a stale measurement.
     assert.equal(engine.autoFold(session, measurement), null)
