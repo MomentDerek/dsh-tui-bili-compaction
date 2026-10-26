@@ -42,6 +42,29 @@ function emptySession(): PersistedSession {
   return { version: STORE_VERSION, state: createInitialState(), contentStore: createContentStore() }
 }
 
+/**
+ * Rename the freshly written temp file over the live one.
+ *
+ * Windows hands out EPERM/EBUSY while a virus scanner or the search indexer
+ * still holds the destination open; those clear within milliseconds, so retry
+ * briefly instead of letting a scan failure drop a compression commit.
+ */
+function renameWithRetry(from: string, to: string): void {
+  let lastError: unknown
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    try {
+      renameSync(from, to)
+      return
+    } catch (error) {
+      lastError = error
+      const code = (error as { code?: unknown }).code
+      if (code !== 'EPERM' && code !== 'EBUSY' && code !== 'EACCES') break
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10 * (attempt + 1))
+    }
+  }
+  throw lastError
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
@@ -222,7 +245,7 @@ export class SessionStore {
     const temp = `${target}.${process.pid}.tmp`
     writeFileSync(temp, JSON.stringify(value), 'utf8')
     try {
-      renameSync(temp, target)
+      renameWithRetry(temp, target)
     } catch (error) {
       rmSync(temp, { force: true })
       throw error

@@ -81,7 +81,7 @@ const AUTO_FOLD_HEADER =
   'shortened); the messages after it are untouched.'
 
 /** Digest cap: the checkpoint must cost far less than what it replaces. */
-const AUTO_FOLD_DIGEST_CAP = 6_000
+const AUTO_FOLD_DIGEST_CAP = 12_000
 
 function textOfBlocks(blocks: readonly DshContentBlock[]): string {
   let text = ''
@@ -98,17 +98,11 @@ function contentLength(message: DshMessage): number {
 
 function digestMessages(messages: readonly DshMessage[]): string {
   const lines: string[] = []
-  let used = 0
-  const push = (line: string): void => {
-    if (used + line.length > AUTO_FOLD_DIGEST_CAP) return
-    used += line.length + 1
-    lines.push(line)
-  }
   for (const message of messages) {
     const role = String(message.role)
     if (role === 'user') {
       const text = textOfBlocks(message.content).trim()
-      if (text.length > 0) push(`- 用户：${text.slice(0, 800)}`)
+      if (text.length > 0) lines.push(`- 用户：${text.slice(0, 800)}`)
       continue
     }
     if (role !== 'assistant') continue
@@ -123,9 +117,17 @@ function digestMessages(messages: readonly DshMessage[]): string {
         parts.push(`[${typeof name === 'string' ? name : 'tool'}]`)
       }
     }
-    if (parts.length > 0) push(`- 助手：${parts.join(' ').slice(0, 320)}`)
+    if (parts.length > 0) lines.push(`- 助手：${parts.join(' ').slice(0, 320)}`)
   }
-  return lines.length === 0 ? '(no summarizable text in this range)' : lines.join('\n')
+  if (lines.length === 0) return '(no summarizable text in this range)'
+  const body = lines.join('\n')
+  if (body.length <= AUTO_FOLD_DIGEST_CAP) return body
+  // Over budget: keep both ends. The oldest lines explain how the work started
+  // and the newest ones say where it stands, which is what a resumed reader
+  // needs most; the middle is the part that can go.
+  const headLength = Math.floor(AUTO_FOLD_DIGEST_CAP * 0.6)
+  const tailLength = AUTO_FOLD_DIGEST_CAP - headLength - 20
+  return `${body.slice(0, headLength)}\n\n…（中段省略）…\n\n${body.slice(body.length - tailLength)}`
 }
 
 
