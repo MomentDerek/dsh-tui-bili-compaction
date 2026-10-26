@@ -396,6 +396,7 @@ function installStepHook(
   ctx: PluginContext,
   engine: CompactionEngine,
   injectNudge: boolean,
+  autoFold: boolean,
   getMeter: () => DshTokenMeter | undefined,
   nativeGuard: NativeCompactionGuard | undefined,
 ): void {
@@ -406,6 +407,21 @@ function installStepHook(
     if (session === undefined) return decision
     if (agent !== undefined) nativeGuard?.patch(agent)
     const measurement = getMeter()?.measure(session)
+    // Automatic folding runs first: it needs no model round-trip, and folding
+    // before the request is built is the whole point of this path.
+    if (autoFold) {
+      try {
+        const folded = engine.autoFold(session, measurement)
+        if (folded !== null) {
+          if (folded.error !== undefined) {
+            console.warn(`[bili-compaction] autoFold could not write its checkpoint: ${folded.error}`)
+          }
+          if (folded.folded > 0) return decision
+        }
+      } catch (error) {
+        console.warn(`[bili-compaction] autoFold failed: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
     // Only advance the kernel's "already told the model" watermark when the
     // nudge is actually delivered below; otherwise a silent pre-step would eat
     // the nudge and compression would never be suggested.
@@ -483,5 +499,12 @@ export function apply(ctx: PluginContext, rawConfig?: PluginOptions): void {
     console.warn('[bili-compaction] no tools service on this context; compress/decompress/acp_status were not registered')
   }
 
-  installStepHook(ctx, engine, options.injectNudge, () => resolveTokenMeter(ctx), nativeGuard)
+  installStepHook(
+    ctx,
+    engine,
+    options.injectNudge,
+    options.autoFold.enabled,
+    () => resolveTokenMeter(ctx),
+    nativeGuard,
+  )
 }

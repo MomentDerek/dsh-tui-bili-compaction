@@ -2,6 +2,60 @@ import { buildKernelConfig } from './config.js';
 import { SUMMARY_HEADER, activeBlocks, baseIdOf, blockById, buildStatusReport, collectBlockContent, createCore, defaultCountTokens, estimateTokensFast, formatRanges, parseBlockIdArg, parseCompressArgs, renderNudgeText, resolvePrompts, validateConfig, } from './kernel.js';
 import { SessionStore } from './store.js';
 import { BLOCK_SOURCE_KIND, buildKernelView, isOwnMessage, renderBlockSummary } from './session-view.js';
+const AUTO_FOLD_HEADER = 'This checkpoint was written automatically by bili-compaction because the visible context crossed its fold threshold. ' +
+    'It condenses the oldest visible messages with a deterministic digest (user requests verbatim, assistant text and tool names ' +
+    'shortened); the messages after it are untouched.';
+/** Digest cap: the checkpoint must cost far less than what it replaces. */
+const AUTO_FOLD_DIGEST_CAP = 6_000;
+function textOfBlocks(blocks) {
+    let text = '';
+    for (const block of blocks) {
+        const value = block.text;
+        if (typeof value === 'string')
+            text += value;
+    }
+    return text;
+}
+function contentLength(message) {
+    return textOfBlocks(message.content).length;
+}
+function digestMessages(messages) {
+    const lines = [];
+    let used = 0;
+    const push = (line) => {
+        if (used + line.length > AUTO_FOLD_DIGEST_CAP)
+            return;
+        used += line.length + 1;
+        lines.push(line);
+    };
+    for (const message of messages) {
+        const role = String(message.role);
+        if (role === 'user') {
+            const text = textOfBlocks(message.content).trim();
+            if (text.length > 0)
+                push(`- 用户：${text.slice(0, 800)}`);
+            continue;
+        }
+        if (role !== 'assistant')
+            continue;
+        const parts = [];
+        for (const block of message.content) {
+            const kind = String(block.type);
+            if (kind === 'text') {
+                const text = block.text ?? '';
+                if (text.trim().length > 0)
+                    parts.push(text.trim().slice(0, 260));
+            }
+            else if (kind === 'tool-call') {
+                const name = block.name;
+                parts.push(`[${typeof name === 'string' ? name : 'tool'}]`);
+            }
+        }
+        if (parts.length > 0)
+            push(`- 助手：${parts.join(' ').slice(0, 320)}`);
+    }
+    return lines.length === 0 ? '(no summarizable text in this range)' : lines.join('\n');
+}
 /**
  * Drop the drill-down rows a model must never copy.
  *
@@ -134,6 +188,126 @@ export class CompactionEngine {
     refresh(session, measurement, options = {}) {
         const synced = this.sync(session, measurement, options);
         return { decision: synced.decision, tokenCount: synced.tokenCount };
+    }
+    /**
+     * Model-free automatic folding, for hosts that want the request kept small
+     * without waiting for the model to answer a nudge.
+     *
+     * When the measured surface is over `autoFold.triggerPct` of the window, the
+     * oldest still-visible messages are condensed into ONE durable
+     * `surfaceOp: 'replace'` checkpoint whose summary is assembled from the
+     * messages themselves (user text verbatim, assistant text/tool names as
+     * snippets). Nothing is written unless the fold actually brings the surface
+     * back toward `autoFold.targetPct`, so a pathological conversation cannot be
+     * rewritten on every step.
+     */
+    autoFold(session, measurement) {
+        const { enabled, triggerPct, targetPct } = this.options.autoFold;
+        if (!enabled)
+            return null;
+        const tokens = measurement?.totalTokens;
+        if (typeof tokens !== 'number' || !Number.isFinite(tokens) || tokens <= 0)
+            return null;
+        const synced = this.sync(session, measurement, { advanceNudge: false });
+        const limit = synced.limit;
+        if (tokens <= limit * triggerPct)
+            return null;
+        const visible = [];
+        for (const seq of session.surface.nodes) {
+            const event = session.eventAt(seq);
+            if (event === undefined)
+                continue;
+            const message = session.deriveEventMessage(event);
+            if (message === null || message === undefined)
+                continue;
+            // Our own checkpoints stay visible: folding a summary into a summary is
+            // how repeated auto-folds would erase the conversation.
+            if (isOwnMessage(message))
+                continue;
+            const role = String(message.role);
+            if (role === 'system' || role === 'developer')
+                continue;
+            visible.push({ seq, role, message, chars: contentLength(message) });
+        }
+        if (visible.length < 12)
+            return null;
+        const totalChars = visible.reduce((sum, node) => sum + node.chars, 0);
+        if (totalChars === 0)
+            return null;
+        const charsPerToken = totalChars / tokens;
+        // Never fold the exchange the model is working in: keep at least the
+        // kernel's protected tail (messages + tokens) verbatim.
+        let tailChars = 0;
+        let tailNodes = 0;
+        for (let index = visible.length - 1; index >= 0; index -= 1) {
+            const node = visible[index];
+            if (node === undefined)
+                break;
+            if (tailNodes >= Math.max(2, this.config.preserveRecentMessages) &&
+                tailChars >= this.config.preserveRecentTokens * charsPerToken) {
+                break;
+            }
+            tailChars += node.chars;
+            tailNodes += 1;
+        }
+        const targetChars = Math.max(Math.floor(limit * targetPct * charsPerToken), tailChars);
+        const need = totalChars - targetChars;
+        // A fold that reclaims less than a fifth of the surface would just churn
+        // the prompt cache; wait for more growth instead.
+        if (need <= totalChars * 0.2)
+            return null;
+        let removed = 0;
+        let cut = -1;
+        const foldable = Math.max(1, visible.length - tailNodes);
+        for (let index = 0; index < foldable; index += 1) {
+            const node = visible[index];
+            if (node === undefined)
+                break;
+            removed += node.chars;
+            const next = visible[index + 1];
+            // Never leave a tool result without its assistant tool-call in front of
+            // it: the next kept message must not be a bare tool result.
+            if (removed >= need && next !== undefined && next.role !== 'tool') {
+                cut = index + 1;
+                break;
+            }
+        }
+        if (cut <= 0)
+            return null;
+        const folded = visible.slice(0, cut);
+        const first = folded[0];
+        const last = folded[folded.length - 1];
+        if (first === undefined || last === undefined)
+            return null;
+        const foldedChars = folded.reduce((sum, node) => sum + node.chars, 0);
+        const keptChars = totalChars - foldedChars;
+        const digest = digestMessages(folded.map((node) => node.message));
+        const text = `${AUTO_FOLD_HEADER}\n\n<compacted-summary>\n${digest}\n</compacted-summary>`;
+        const startSeq = first.seq;
+        const endSeq = last.seq;
+        try {
+            session.append('user/message', {
+                id: `bili_autofold_${startSeq}`,
+                role: 'user',
+                content: [{ type: 'text', text }],
+                source: { kind: BLOCK_SOURCE_KIND, blockId: `auto-${startSeq}` },
+            }, { surfaceOp: { op: 'replace', startSeq, endSeq }, sourceEventSeqs: folded.map((node) => node.seq) });
+        }
+        catch (error) {
+            return {
+                folded: 0,
+                foldedChars: 0,
+                keptChars: totalChars,
+                error: error instanceof Error ? error.message : String(error),
+                text: '',
+            };
+        }
+        return {
+            folded: folded.length,
+            foldedChars,
+            keptChars,
+            text: `autoFold: condensed ${folded.length} message(s) (${describeTokens(Math.round(foldedChars / charsPerToken))} tokens) into one checkpoint; ~${describeTokens(Math.round(keptChars / charsPerToken))} tokens remain visible.`,
+        };
     }
     /**
      * Bring the persisted LSM up to date with the session log.

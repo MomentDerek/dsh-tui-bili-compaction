@@ -742,6 +742,54 @@ test('a suppressed nudge does not advance the watermark', () => {
   }
 })
 
+test('autoFold condenses the oldest visible messages without a model call', () => {
+  const dir = temporaryDir()
+  try {
+    const session = new FakeSession()
+    for (let index = 0; index < 16; index += 1) {
+      session.push(index % 2 === 0 ? userMessage(`u${index}`, filler(3000)) : assistantMessage(`a${index}`, filler(3000)))
+    }
+    const options = resolveOptions({
+      storageDir: dir,
+      modelContextLimit: 40_000,
+      autoFold: { enabled: true, triggerPct: 0.2, targetPct: 0.1 },
+    })
+    const engine = new CompactionEngine(options, new SessionStore(dir))
+    const measurement = { totalTokens: 30_000, surfaceTokens: 30_000, nodes: [] }
+    const before = session.surfaceNodes.length
+
+    const folded = engine.autoFold(session, measurement)
+    assert.ok(folded, 'expected a fold')
+    assert.ok(folded.folded > 0)
+    assert.ok(session.surfaceNodes.length < before)
+
+    const replacement = session.events.find((event) => event.surfaceOp?.op === 'replace')
+    assert.ok(replacement, 'expected a durable replacement')
+    const text = replacement.data.content.map((block) => block.text).join('\n')
+    assert.match(text, /written automatically by bili-compaction/)
+    assert.match(text, /<compacted-summary>/)
+
+    // The retained tail is too small to fold again with a stale measurement.
+    assert.equal(engine.autoFold(session, measurement), null)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('autoFold stays off unless enabled', () => {
+  const dir = temporaryDir()
+  try {
+    const session = new FakeSession()
+    for (let index = 0; index < 16; index += 1) session.push(userMessage(`u${index}`, filler(3000)))
+    const options = resolveOptions({ storageDir: dir, modelContextLimit: 40_000 })
+    const engine = new CompactionEngine(options, new SessionStore(dir))
+    assert.equal(engine.autoFold(session, { totalTokens: 30_000, surfaceTokens: 30_000, nodes: [] }), null)
+    assert.equal(session.surfaceNodes.length, 16)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('read-only status does not consume the nudge watermark', () => {
   const dir = temporaryDir()
   try {

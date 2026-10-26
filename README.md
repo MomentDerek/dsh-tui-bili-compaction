@@ -59,10 +59,23 @@ dsh 的 model-visible surface 本身是一次折叠。如果内核也只看 surf
     storageDir: null             # 默认 LOCALAPPDATA 下的插件状态目录
     languagePreservation: false  # 摘要保留原文语言
     injectNudge: false           # 见下
+    autoFold:                    # 模型无关的自动折叠，默认关闭
+      enabled: false
+      triggerPct: 0.2            # 越过窗口的 20% 就开始折
+      targetPct: 0.1             # 折回到 10%（受 preserveRecentMessages/Tokens 保护尾约束）
     kernel: {}                   # 透传给内核 defaultConfig(modelContextLimit, overrides)
 ```
 
 `kernel` 可覆盖内核的任何配置，例如 `kernel: { compress: { minCompressRange: 2000 } }`、`kernel: { tiers: { enabled: false } }`。
+
+## autoFold：不等模型的自动折叠
+
+内核只“建议”折叠，真正的 `compress` 摘要由模型写。模型不配合时（或者你根本不想让它花一次工具调用），打开 `autoFold`：pre-step 里一旦测得 surface 超过 `triggerPct`，插件自己挑**最老的可见消息**，用确定性摘要（用户消息原文、助手文本与工具调用名）写一条 `surfaceOp: 'replace'` checkpoint，一次只折一段，折到 `targetPct` 以下或不足 20% 收益为止。
+
+- 摘要里**没有模型参与**，所以细节会丢：适合“先把窗口压下去继续干活”，不适合代替人工整理的总结；
+- 折叠范围永远避开 `preserveRecentMessages` / `preserveRecentTokens` 保护的尾部（当前这轮对话不会被折）；
+- 插件自己写的 checkpoint 不会被再次折叠，避免“摘要的摘要”；
+- 折掉的原文仍在 append-only 日志里，但 `decompress` 只认内核 block，这类 checkpoint 只能靠日志回溯。
 
 ## 原生压缩守卫
 

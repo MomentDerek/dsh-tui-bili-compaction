@@ -18,6 +18,14 @@ export interface StatusQuery {
     sort?: 'size' | 'time';
     limit?: number;
 }
+/** Outcome of one model-free automatic fold. */
+export interface AutoFoldResult {
+    folded: number;
+    foldedChars: number;
+    keptChars: number;
+    text: string;
+    error?: string;
+}
 /**
  * The dsh-side driver around the kernel.
  *
@@ -63,6 +71,19 @@ export declare class CompactionEngine {
     refresh(session: DshSessionLike, measurement?: DshTokenMeasurement, options?: {
         advanceNudge?: boolean;
     }): RefreshResult;
+    /**
+     * Model-free automatic folding, for hosts that want the request kept small
+     * without waiting for the model to answer a nudge.
+     *
+     * When the measured surface is over `autoFold.triggerPct` of the window, the
+     * oldest still-visible messages are condensed into ONE durable
+     * `surfaceOp: 'replace'` checkpoint whose summary is assembled from the
+     * messages themselves (user text verbatim, assistant text/tool names as
+     * snippets). Nothing is written unless the fold actually brings the surface
+     * back toward `autoFold.targetPct`, so a pathological conversation cannot be
+     * rewritten on every step.
+     */
+    autoFold(session: DshSessionLike, measurement?: DshTokenMeasurement): AutoFoldResult | null;
     /**
      * Bring the persisted LSM up to date with the session log.
      *

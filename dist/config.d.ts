@@ -22,6 +22,19 @@ export interface PluginOptions {
      *  ephemeral message channel, so this writes a real `user/message` event and
      *  is off by default; the same text is available through `acp_status`. */
     injectNudge?: boolean;
+    /** Automatic folding without a model call: when the measured surface passes
+     *  `triggerPct` of the window, the plugin condenses the oldest visible
+     *  messages into one durable checkpoint with a mechanical digest. Off by
+     *  default; folding replaces surface content, so opt in deliberately. */
+    autoFold?: AutoFoldOptions;
+}
+/** Thresholds for the model-free `autoFold` path. */
+export interface AutoFoldOptions {
+    enabled?: boolean;
+    /** Fold once the measured surface exceeds this fraction of the window. */
+    triggerPct?: number;
+    /** Keep folding until the surface is back under this fraction. */
+    targetPct?: number;
 }
 export declare const DEFAULT_MODEL_CONTEXT_LIMIT = 1000000;
 export interface ResolvedOptions {
@@ -34,6 +47,7 @@ export interface ResolvedOptions {
     storageDir: string | undefined;
     languagePreservation: boolean;
     injectNudge: boolean;
+    autoFold: Required<AutoFoldOptions>;
 }
 export declare function resolveOptions(raw: PluginOptions | undefined): ResolvedOptions;
 export declare function buildKernelConfig(options: ResolvedOptions): Config;
