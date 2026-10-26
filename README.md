@@ -118,22 +118,35 @@ node scripts/rescue-session.mjs <sessionId> tmp-rescue/plan.json tmp-rescue/summ
 
 写入前会把原日志复制成 `*.bak-<时间戳>`；写入后 `foldSurface` 校验通过、token 估算落回窗口内，才建议重启 dsh-tui 继续该会话。跑过这一步之后，插件守卫里的“溢出恢复委派”会接管后续增长。
 
-如果折叠完仍然贴着窗口（`requested … tokens (… in the messages, … in the completion)` 里 messages 已经低于窗口、但 completion 把总数顶出去），说明 harness 把“窗口剩余量”当成了输出预算，而它的 token 估算比 provider 实测低几个百分点。这时再跑一次确定性收尾——把最近若干轮之外的超大工具结果替换成头尾片段（和 dsh 自带的 tool-result-pruner 同样的 durable 形状，不需要模型摘要）：
+如果折叠完仍然贴着窗口（`requested … tokens (… in the messages, … in the completion)` 里 messages 已经低于窗口、但 completion 把总数顶出去），说明 harness 把“窗口剩余量”当成了输出预算，而它的 token 估算比 provider 实测低几个百分点。两条对策一起用：
+
+1. 给路由的模型钉一个输出上限，别让 harness 用窗口剩余量当输出预算：
+
+   ```yaml
+   providers:
+     deepseek:
+       models:
+         - id: deepseek-flash
+           maxTokens: 32768
+   ```
+
+2. 再折一层：`rescue-fold2.mjs` 会在已有 checkpoint 之后继续折叠最老的一段消息，用机械摘要（用户消息全文 + 助手片段 + 工具调用名）替代模型调用，最近若干轮保持原文：
+
+   ```powershell
+   node scripts/rescue-fold2.mjs <sessionId> --target-chars 950000          # 干跑
+   node scripts/rescue-fold2.mjs <sessionId> --target-chars 950000 --apply  # 备份后写入
+   ```
+
+**不要用 `rescue-prune.mjs` 处理已经关闭的日志**：`tool/result` 的 surface replacement 必须落在某个 open turn 里（dsh 的 v4 格式校验会报 `tool/result is outside an open turn`），而救援时日志末尾的 turn 早已 `turn/end`。该脚本只适合在会话仍开着、且知道当前 turn 的情况下使用。
+
+每个脚本写完后都可以用 dsh 自己的校验器复核：
 
 ```powershell
-node scripts/rescue-prune.mjs <sessionId> --target-chars 1120000 --budget 400          # 干跑
-node scripts/rescue-prune.mjs <sessionId> --target-chars 1120000 --budget 400 --apply  # 备份后写入
+node scripts/rescue-validate.mjs <sessionFile>        # foldSurface：surface 折叠是否合法
+node scripts/format-check.mjs <sessionFile>           # 完整 v4 格式校验（与 dsh-tui 恢复时同一套规则）
 ```
 
-另外可以在 provider 配置里给模型加一个明确的 `maxTokens`（例如 32768），别让 harness 用“窗口剩余量”当输出预算：
-
-```yaml
-providers:
-  deepseek:
-    models:
-      - id: deepseek-flash
-        maxTokens: 32768
-```
+`format-check.mjs` 需要能找到安装好的 dsh；它会从 `%APPDATA%/fnm/node-versions/*` 里挑最新版本。改完日志后请先跑它，通过再重启 dsh-tui。
 
 ## 开发
 
