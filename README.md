@@ -118,6 +118,23 @@ node scripts/rescue-session.mjs <sessionId> tmp-rescue/plan.json tmp-rescue/summ
 
 写入前会把原日志复制成 `*.bak-<时间戳>`；写入后 `foldSurface` 校验通过、token 估算落回窗口内，才建议重启 dsh-tui 继续该会话。跑过这一步之后，插件守卫里的“溢出恢复委派”会接管后续增长。
 
+如果折叠完仍然贴着窗口（`requested … tokens (… in the messages, … in the completion)` 里 messages 已经低于窗口、但 completion 把总数顶出去），说明 harness 把“窗口剩余量”当成了输出预算，而它的 token 估算比 provider 实测低几个百分点。这时再跑一次确定性收尾——把最近若干轮之外的超大工具结果替换成头尾片段（和 dsh 自带的 tool-result-pruner 同样的 durable 形状，不需要模型摘要）：
+
+```powershell
+node scripts/rescue-prune.mjs <sessionId> --target-chars 1120000 --budget 400          # 干跑
+node scripts/rescue-prune.mjs <sessionId> --target-chars 1120000 --budget 400 --apply  # 备份后写入
+```
+
+另外可以在 provider 配置里给模型加一个明确的 `maxTokens`（例如 32768），别让 harness 用“窗口剩余量”当输出预算：
+
+```yaml
+providers:
+  deepseek:
+    models:
+      - id: deepseek-flash
+        maxTokens: 32768
+```
+
 ## 开发
 
 ```powershell
