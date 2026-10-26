@@ -24,4 +24,6 @@ SOFTWARE.
 
 The vendored compression kernel in vendor/acp-kernel/ is part of
 billion-context (https://github.com/ranxianglei/billion-context) and is
-distributed under the MIT License, Copyright (c) 2026 ranxianglei.
+distributed under the MIT License plus an Additional Term requiring
+attribution, Copyright (c) 2026 ranxianglei. See
+vendor/acp-kernel/LICENSE and THIRD_PARTY_NOTICES.md for the full text.

@@ -5,11 +5,10 @@
 # loader resolves `name` from the profile's node_modules.
 #
 # The row's `config` is the plugin's `PluginOptions` (see README). Native
-# compaction is switched off at runtime by the plugin's `internal/config`
-# listener, not by patching rows here: dsh-tui composes its presets in their own
-# realm, so there is no row id this patch layer could address.
+# compaction is switched off at runtime by the plugin's preset-service guard
+# (`compaction` + `toolResultPruner`), not by patching rows here: dsh-tui
+# composes its presets in their own realm, so there is no row id this patch
+# layer could address.
 - insert:
     - id: bili-compaction
       name: dsh-tui-bili-compaction
-      config:
-        modelContextLimit: 1000000

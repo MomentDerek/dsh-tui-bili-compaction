@@ -6,13 +6,14 @@ import { defaultConfig } from './kernel.js'
  * and falls back to a value that is safe for a 1M-token model.
  */
 export interface PluginOptions {
-  /** Route context window. dsh does not hand a plugin the resolved model
-   *  metadata, so the operator states it once here. */
+  /** Pin the route context window. When omitted, the engine prefers the live
+   *  session's advertised window and only falls back to 1M. Set this when the
+   *  route advertises a window larger than the budget you want to enforce. */
   modelContextLimit?: number
   /** Additional kernel config (tiers, nudge, truncate, ccr, ...). */
   kernel?: Partial<Config>
-  /** Fold `@deepseek-ai/dsh-compaction-basic` / `dsh-command-compact` out of
-   *  the composed config so only this engine compresses. Default true. */
+  /** Disable the live preset's `compaction` service (`compactIfNeeded` /
+   *  `compactNow`) so only this engine compresses. Default true. */
   disableNativeCompaction?: boolean
   /** Directory holding per-session kernel state. Default: the plugin's state
    *  dir under LOCALAPPDATA. */
@@ -29,6 +30,9 @@ export const DEFAULT_MODEL_CONTEXT_LIMIT = 1_000_000
 
 export interface ResolvedOptions {
   modelContextLimit: number
+  /** True when the operator pinned `modelContextLimit`; otherwise the live
+   *  session's advertised `requestContext().contextWindow` may override it. */
+  modelContextLimitExplicit: boolean
   kernel: Partial<Config>
   disableNativeCompaction: boolean
   storageDir: string | undefined
@@ -38,8 +42,10 @@ export interface ResolvedOptions {
 
 export function resolveOptions(raw: PluginOptions | undefined): ResolvedOptions {
   const limit = raw?.modelContextLimit
+  const explicitLimit = typeof limit === 'number' && Number.isFinite(limit) && limit > 0 ? limit : undefined
   return {
-    modelContextLimit: typeof limit === 'number' && limit > 0 ? limit : DEFAULT_MODEL_CONTEXT_LIMIT,
+    modelContextLimit: explicitLimit ?? DEFAULT_MODEL_CONTEXT_LIMIT,
+    modelContextLimitExplicit: explicitLimit !== undefined,
     kernel: raw?.kernel ?? {},
     disableNativeCompaction: raw?.disableNativeCompaction !== false,
     storageDir: typeof raw?.storageDir === 'string' && raw.storageDir.length > 0 ? raw.storageDir : undefined,

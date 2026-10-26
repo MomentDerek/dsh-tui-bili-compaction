@@ -87,12 +87,27 @@ export interface DshSessionLike {
   eventAt(seq: number): unknown
   deriveEventMessage(event: unknown): DshMessage | null
   append(type: string, data: unknown, options?: DshSessionAppendOptions): { seq: number }
-  requestHeader?(): { config?: { contextWindow?: number } } | undefined
+  /** Latest route metadata; dsh advertises the real window here when known. */
+  requestContext?(): { contextWindow?: number } | undefined
+}
+
+export interface DshAgentContextLike {
+  /** Loader base URL, used as a module-resolution anchor for harness packages. */
+  readonly baseUrl?: string | URL
+  get?(name: string): unknown
+  [key: string]: unknown
 }
 
 export interface DshAgentLike {
   session?: DshSessionLike
   options?: { provider?: string; model?: string }
+  /** Present on a live dsh Agent; used by `agentPresets.serviceFor`. */
+  readonly ctx?: DshAgentContextLike
+}
+
+/** The preset registry can read a service out of an isolated preset realm. */
+export interface DshAgentPresetsLike {
+  serviceFor?(agent: DshAgentLike, name: string): unknown
 }
 
 export interface DshTokenSurfaceNode {

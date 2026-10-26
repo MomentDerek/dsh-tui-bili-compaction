@@ -1,0 +1,1 @@
+{"version":3,"file":"formats.d.ts","sourceRoot":"","sources":["../../src/wire/formats.ts"],"names":[],"mappings":"AAAA,eAAO,MAAM,YAAY,yDAKf,CAAC;AACX,MAAM,MAAM,UAAU,GAAG,CAAC,OAAO,YAAY,CAAC,CAAC,MAAM,CAAC,CAAC;AAEvD,wBAAgB,YAAY,CAAC,KAAK,EAAE,OAAO,GAAG,KAAK,IAAI,UAAU,CAKhE;AAED;;;;GAIG;AACH,wBAAgB,gBAAgB,CAAC,OAAO,EAAE,OAAO,GAAG,UAAU,GAAG,SAAS,CAkCzE"}

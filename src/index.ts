@@ -1,6 +1,16 @@
+import { createRequire } from 'node:module'
+import { join } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import type { PluginOptions } from './config.js'
 import { resolveOptions } from './config.js'
-import type { DshAgentLike, DshSessionLike, DshTokenMeter, DshTokenMeasurement, DshToolDefinition } from './dsh-types.js'
+import type {
+  DshAgentLike,
+  DshAgentPresetsLike,
+  DshSessionLike,
+  DshTokenMeter,
+  DshTokenMeasurement,
+  DshToolDefinition,
+} from './dsh-types.js'
 import { CompactionEngine } from './engine.js'
 import { SessionStore } from './store.js'
 import { registerTools } from './tools.js'
@@ -22,7 +32,6 @@ import { registerTools } from './tools.js'
 
 export const name = 'bili-compaction'
 
-/** Native compaction is disabled first, then tools are registered. */
 export const inject: readonly string[] = []
 
 const NATIVE_COMPACTION = new Set([
@@ -69,12 +78,13 @@ function rewriteRows(rows: readonly unknown[]): { rows: unknown[]; changed: numb
 }
 
 /**
- * Fold `@deepseek-ai/dsh-compaction-basic` and `@deepseek-ai/dsh-command-compact`
- * out of the composed plugin tree.
+ * Legacy helper for synthesised plugin trees.
  *
- * dsh composes the preset's plugin rows from the host config, so disabling them
- * here (rather than in a preset file) covers every preset dsh-tui can mount,
- * including custom ones.
+ * Do not use this for dsh-tui: `internal/config` is dispatched with a single
+ * loader entry's own config, and bundled presets are mounted as `PresetTree`s
+ * outside the host loader. Keeping the helper lets callers that already own a
+ * composed tree reuse the rewrite, but the live plugin disables native
+ * compaction through `installNativeCompactionGuard` instead.
  */
 export function stripNativeCompaction(config: unknown): { config: unknown; changed: number } {
   if (typeof config !== 'object' || config === null) return { config, changed: 0 }
@@ -88,6 +98,8 @@ export function stripNativeCompaction(config: unknown): { config: unknown; chang
 type Listener = (...args: never[]) => unknown
 
 export interface PluginContext {
+  /** Loader base URL, used as a module-resolution anchor for harness packages. */
+  readonly baseUrl?: string | URL
   on(event: string, listener: Listener, options?: { global?: boolean }): () => void
   get?(name: string): unknown
   inject?(deps: readonly string[], callback: (ctx: PluginContext) => void): () => void
@@ -143,6 +155,226 @@ function resolveSession(ctx: PluginContext): DshSessionLike | undefined {
   return asAgents(safeGet(ctx, 'agents'))?.currentInitiator?.()?.session
 }
 
+function asAgentPresets(value: unknown): DshAgentPresetsLike | undefined {
+  if (typeof value !== 'object' || value === null) return undefined
+  return value as DshAgentPresetsLike
+}
+
+/** Read a preset-realm service from the agent itself when the registry is absent. */
+function serviceFromAgent(agent: DshAgentLike, name: string): unknown {
+  const agentContext = agent.ctx
+  if (typeof agentContext !== 'object' || agentContext === null) return undefined
+  const context = agentContext as { get?: (service: string) => unknown; [key: string]: unknown }
+  if (typeof context.get === 'function') {
+    try {
+      const service = context.get(name)
+      if (service !== undefined) return service
+    } catch {
+      // An uninjected service throws; fall through to the property read.
+    }
+  }
+  try {
+    return context[name]
+  } catch {
+    return undefined
+  }
+}
+
+interface ManualCompactionErrorConstructor {
+  new (code: string, message: string, options?: { cause?: unknown }): Error & { code: string; name: string }
+}
+
+let cachedManualCompactionError: ManualCompactionErrorConstructor | undefined
+let loadingManualCompactionError: Promise<ManualCompactionErrorConstructor | undefined> | undefined
+
+/**
+ * Resolve `@deepseek-ai/dsh-compaction` from the profile realm.
+ *
+ * A profile plugin cannot statically import harness packages (`package.json`
+ * dependencies are not the profile's), but the agent context carries the
+ * loader base URL. Resolve from that anchor (and a few fallbacks), then import
+ * the resolved ESM file. Caching the constructor keeps `/compact` failures
+ * classified as `ManualCompactionError` for the life of the plugin.
+ */
+function moduleAnchors(agent: DshAgentLike, ctx: PluginContext): string[] {
+  const anchors: string[] = []
+  const base = agent.ctx?.baseUrl ?? ctx.baseUrl
+  if (base !== undefined) {
+    try {
+      if (typeof base === 'string' && !/^[a-z][a-z0-9+.-]*:/i.test(base)) {
+        anchors.push(pathToFileURL(join(base, '__bili_compaction_probe__.cjs')).href)
+      } else {
+        const url = typeof base === 'string' ? new URL(base) : base
+        anchors.push(url.href)
+        const directory = url.href.endsWith('/') ? url : new URL(`${url.href}/`)
+        anchors.push(new URL('__bili_compaction_probe__.cjs', directory).href)
+      }
+    } catch {
+      // A malformed base URL only loses this anchor.
+    }
+  }
+  anchors.push(pathToFileURL(join(process.cwd(), '__bili_compaction_probe__.cjs')).href)
+  anchors.push(import.meta.url)
+  return anchors
+}
+
+async function loadManualCompactionError(
+  agent: DshAgentLike,
+  ctx: PluginContext,
+): Promise<ManualCompactionErrorConstructor | undefined> {
+  if (cachedManualCompactionError !== undefined) return cachedManualCompactionError
+  if (loadingManualCompactionError !== undefined) return loadingManualCompactionError
+  loadingManualCompactionError = (async (): Promise<ManualCompactionErrorConstructor | undefined> => {
+    for (const anchor of moduleAnchors(agent, ctx)) {
+      try {
+        const resolver = createRequire(anchor)
+        let resolved: string | undefined
+        try {
+          // `/compact` imports the error from *its own* dsh-compaction copy.
+          // Resolving through the command module keeps `instanceof` aligned
+          // even when the profile has more than one pnpm instance installed.
+          const command = resolver.resolve('@deepseek-ai/dsh-command-compact')
+          resolved = createRequire(pathToFileURL(command).href).resolve('@deepseek-ai/dsh-compaction')
+        } catch {
+          resolved = resolver.resolve('@deepseek-ai/dsh-compaction')
+        }
+        const loaded = (await import(pathToFileURL(resolved).href)) as { ManualCompactionError?: unknown }
+        if (typeof loaded.ManualCompactionError === 'function') {
+          cachedManualCompactionError = loaded.ManualCompactionError as ManualCompactionErrorConstructor
+          return cachedManualCompactionError
+        }
+      } catch {
+        // Try the next anchor; the profile realm is not required to expose it.
+      }
+    }
+    return undefined
+  })()
+  try {
+    return await loadingManualCompactionError
+  } finally {
+    loadingManualCompactionError = undefined
+  }
+}
+
+/** Build an error `/compact` recognizes as an expected cancellation. */
+function disabledCompactionError(
+  ctor: ManualCompactionErrorConstructor | undefined,
+  message: string,
+): Error & { code: string; name: string } {
+  if (ctor !== undefined) return new ctor('cancelled', message)
+  const error = new Error(message) as Error & { code: string; name: string }
+  error.name = 'ManualCompactionError'
+  error.code = 'cancelled'
+  return error
+}
+
+interface NativeCompactionGuard {
+  /** Disable native surface mutators for this agent's preset realm. */
+  patch(agent: DshAgentLike): void
+  dispose(): void
+}
+
+/**
+ * dsh-tui mounts bundled presets as in-memory `PresetTree`s, so a profile-level
+ * `internal/config` rewrite can never reach their `compaction-basic` row. The
+ * preset registry does expose the live service, though, and the automatic
+ * compaction listener dispatches through `this.compactIfNeeded`. Patching that
+ * one method is the only seam available to a profile plugin on dsh-tui 0.14.x;
+ * without it native compaction keeps folding the surface behind this engine's
+ * append-origin view.
+ *
+ * `compactNow` is the manual `/compact` entry point; it is disabled too so the
+ * two compaction systems cannot both write `compaction/summary` checkpoints.
+ */
+function installNativeCompactionGuard(ctx: PluginContext): NativeCompactionGuard {
+  let presets = asAgentPresets(safeGet(ctx, 'agentPresets'))
+  const patched = new WeakSet<object>()
+  const restores: Array<{ target: Record<string, unknown>; method: string; original: unknown }> = []
+  let warned = false
+  let warnedMissing = false
+
+  const resolveService = (agent: DshAgentLike, name: string): unknown => {
+    if (presets === undefined || typeof presets.serviceFor !== 'function') {
+      // The registry can appear after this plugin's `apply`; probe again.
+      presets = asAgentPresets(safeGet(ctx, 'agentPresets'))
+    }
+    if (presets !== undefined && typeof presets.serviceFor === 'function') {
+      try {
+        const service = presets.serviceFor(agent, name)
+        if (service !== undefined) return service
+      } catch {
+        // Fall through to the agent's preset-scoped context.
+      }
+    }
+    return serviceFromAgent(agent, name)
+  }
+
+  const patchService = (
+    agent: DshAgentLike,
+    name: string,
+    replacements: Readonly<Record<string, (...args: unknown[]) => unknown>>,
+  ): void => {
+    const service = resolveService(agent, name)
+    if (service === undefined) {
+      if (name === 'compaction' && !warnedMissing) {
+        warnedMissing = true
+        console.warn('[bili-compaction] compaction service is unavailable; native compaction cannot be disabled and may fold the surface alongside this plugin')
+      }
+      return
+    }
+    if (typeof service !== 'object' || service === null || patched.has(service)) return
+    patched.add(service)
+    const target = service as Record<string, unknown>
+    for (const [method, replacement] of Object.entries(replacements)) {
+      if (typeof target[method] !== 'function') continue
+      const original = target[method]
+      try {
+        target[method] = replacement
+        restores.push({ target, method, original })
+      } catch {
+        if (!warned) {
+          warned = true
+          console.warn(`[bili-compaction] could not disable native compaction service method "${method}"; automatic compaction may still run alongside this plugin`)
+        }
+      }
+    }
+  }
+
+  const patch = (agent: DshAgentLike): void => {
+    patchService(agent, 'compaction', {
+      compactIfNeeded: async (): Promise<null> => null,
+      compactNow: async (): Promise<never> => {
+        const ctor = await loadManualCompactionError(agent, ctx)
+        throw disabledCompactionError(
+          ctor,
+          'native compaction is disabled by bili-compaction; use the compress tool instead',
+        )
+      },
+    })
+    // The pruner writes its own durable surface replacements. It is currently
+    // disabled inside dsh-compaction-basic, but guard it defensively so a build
+    // that re-enables pruning cannot mutate the surface behind this engine.
+    patchService(agent, 'toolResultPruner', {
+      pruneContent: (): null => null,
+      pruneSession: (): { pruned: never[]; charsRemoved: number } => ({ pruned: [], charsRemoved: 0 }),
+    })
+  }
+
+  return {
+    patch,
+    dispose(): void {
+      for (const { target, method, original } of restores) {
+        try {
+          target[method] = original
+        } catch {
+          // The service realm is already gone; nothing to restore.
+        }
+      }
+      restores.length = 0
+    },
+  }
+}
+
 /**
  * Warm the kernel on every step and (optionally) hand the model its nudge.
  *
@@ -151,13 +383,20 @@ function resolveSession(ctx: PluginContext): DshSessionLike | undefined {
  * (`injectNudge`). Left off, the same text is reachable through `acp_status`,
  * which costs one tool call and nothing in the log.
  */
-function installStepHook(ctx: PluginContext, engine: CompactionEngine, injectNudge: boolean, meter: DshTokenMeter | undefined): void {
+function installStepHook(
+  ctx: PluginContext,
+  engine: CompactionEngine,
+  injectNudge: boolean,
+  getMeter: () => DshTokenMeter | undefined,
+  nativeGuard: NativeCompactionGuard | undefined,
+): void {
   const listener = async (payload: unknown, next: () => Promise<unknown>): Promise<unknown> => {
     const decision = await next()
     const agent = (payload as { agent?: DshAgentLike } | undefined)?.agent
     const session = agent?.session
     if (session === undefined) return decision
-    const measurement = meter?.measure(session)
+    if (agent !== undefined) nativeGuard?.patch(agent)
+    const measurement = getMeter()?.measure(session)
     const refreshed = engine.refresh(session, measurement)
     if (!injectNudge) return decision
     const text = engine.nudgeText(refreshed.decision)
@@ -184,14 +423,17 @@ function installStepHook(ctx: PluginContext, engine: CompactionEngine, injectNud
 export function apply(ctx: PluginContext, rawConfig?: PluginOptions): void {
   const options = resolveOptions(rawConfig)
   const engine = new CompactionEngine(options, new SessionStore(options.storageDir))
-
-  if (options.disableNativeCompaction) {
-    const listener = (config: unknown, next: () => unknown): unknown => {
-      const resolved = next()
-      const rewritten = stripNativeCompaction(resolved)
-      return rewritten.config
+  const nativeGuard = options.disableNativeCompaction ? installNativeCompactionGuard(ctx) : undefined
+  if (nativeGuard !== undefined) {
+    ctx.effect?.(() => () => nativeGuard.dispose())
+    // Patch at creation, before the first `agent/pre-step`: the preset's own
+    // automatic-compaction listener may be ordered ahead of this plugin's hook,
+    // and it would otherwise get one uncompacted step through.
+    const onCreated = (payload: unknown): void => {
+      const agent = (payload as { agent?: DshAgentLike } | undefined)?.agent
+      if (agent !== undefined) nativeGuard.patch(agent)
     }
-    ctx.on('internal/config', listener as unknown as Listener, { global: true })
+    ctx.on('agent/created', onCreated as unknown as Listener, { global: true })
   }
 
   const measureFor = (host: PluginContext): ((session: DshSessionLike) => DshTokenMeasurement) | undefined => {
@@ -229,5 +471,5 @@ export function apply(ctx: PluginContext, rawConfig?: PluginOptions): void {
     console.warn('[bili-compaction] no tools service on this context; compress/decompress/acp_status were not registered')
   }
 
-  installStepHook(ctx, engine, options.injectNudge, resolveTokenMeter(ctx))
+  installStepHook(ctx, engine, options.injectNudge, () => resolveTokenMeter(ctx), nativeGuard)
 }

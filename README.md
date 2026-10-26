@@ -1,8 +1,11 @@
 # dsh-tui-bili-compaction
 
+[![CI](https://github.com/MomentDerek/dsh-tui-bili-compaction/actions/workflows/ci.yml/badge.svg)](https://github.com/MomentDerek/dsh-tui-bili-compaction/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 dsh 专用上下文压缩：**把 billion-context 的内核搬进 dsh 进程**，用 dsh 自己的压缩契约落地，替掉 bili 的代理级压缩。
 
-- 压缩引擎 = [`billion-context`](https://github.com/ranxianglei/billion-context) 的 `acp-kernel`（3-tier LSM：block / tier / ref、`compress` / `decompress` / `acp_status` 工具、nudge 与状态持久化），已 vendor 到 `vendor/acp-kernel/`（MIT，见 `PROVENANCE`）。
+- 压缩引擎 = [`billion-context`](https://github.com/ranxianglei/billion-context) 的 [`acp-kernel`](https://github.com/ranxianglei/acp-kernel)（3-tier LSM：block / tier / ref、`compress` / `decompress` / `acp_status` 工具、nudge 与状态持久化），已 vendor 到 `vendor/acp-kernel/`（MIT + 附加署名条款，见 `THIRD_PARTY_NOTICES.md`）。
 - 落地方式 = dsh 官方的 **durable surface replacement**：一条 `user/message` 带 `surfaceOp: {op:'replace', startSeq, endSeq}` 遮蔽被折掉的区间。transcript、token meter、状态栏读的都是这一层折叠，所以不需要再“骗”任何一个消费者。
 - 没有代理、没有 `globalThis.fetch` 改写、没有 HTTP manifest：工具直接以 `ctx.tools.register` 注册，状态直接落 JSON。
 
@@ -29,14 +32,14 @@ dsh 的 model-visible surface 本身是一次折叠。如果内核也只看 surf
 因此内核视图取的是**整条日志里 `surfaceOp: 'append'` 的原始事件**（`src/session-view.ts`）：
 
 - 只增不减 → block 覆盖的 id 永远在视图里，`syncBlocks` 不会把块判死。
-- `ledgerSeq = dshSeq + 1` → ref 恒等于 `m{dshSeq+1}`，一个会话内永久稳定（`assignRefs` 直接采信 `ledgerSeq`）。
+- `ledgerSeq = dshSeq + 1` → 一个事件的第一条消息 ref 等于 `m{dshSeq+1}`，一个会话内永久稳定（`assignRefs` 直接采信 `ledgerSeq`）。一条 dsh 事件可能带多个 content block（reasoning + text + tool-call），兄弟 block 会占用后续空闲 ref；`compress` 必须覆盖整条事件的所有 block，否则会被拒绝，避免只摘要了 text 却把 reasoning 一起遮掉。
 - 本插件自己写入的摘要/提示消息带 `source.kind = 'bili-compaction'`，重建视图时排除，不会被二次压缩。
 
 ## 组件
 
 | 文件 | 职责 |
 | --- | --- |
-| `src/index.ts` | 插件入口（`name = 'bili-compaction'`）；`internal/config` 中间件摘掉原生压缩行；注册工具 |
+| `src/index.ts` | 插件入口（`name = 'bili-compaction'`）；原生压缩守卫（patch preset 内 `compaction` / `toolResultPruner` 服务）；注册工具 |
 | `src/session-view.ts` | dsh 日志 → `CoreMessage[]`（append-origin、`ledgerSeq`、保护集） |
 | `src/engine.ts` | `refresh` / `compress` / `decompress` / `status`：内核状态与 durable replace 的桥 |
 | `src/tools.ts` | `compress` / `decompress` / `acp_status` 三个 dsh 工具（schema 直接复用内核常量） |
@@ -51,8 +54,8 @@ dsh 的 model-visible surface 本身是一次折叠。如果内核也只看 surf
 ```yaml
 - id: bili-compaction
   config:
-    modelContextLimit: 1000000   # dsh 不把模型上下文窗口交给插件，这里自己声明
-    disableNativeCompaction: true # 默认 true：摘掉 dsh-compaction-basic / dsh-command-compact
+    modelContextLimit: 1000000   # 可选：显式钉死窗口；省略时优先用 dsh 会话通告的窗口，最终回退 1M
+    disableNativeCompaction: true # 默认 true：patch 预设内 compaction 服务的 compactIfNeeded / compactNow
     storageDir: null             # 默认 LOCALAPPDATA 下的插件状态目录
     languagePreservation: false  # 摘要保留原文语言
     injectNudge: false           # 见下
@@ -61,9 +64,19 @@ dsh 的 model-visible surface 本身是一次折叠。如果内核也只看 surf
 
 `kernel` 可覆盖内核的任何配置，例如 `kernel: { compress: { minCompressRange: 2000 } }`、`kernel: { tiers: { enabled: false } }`。
 
+## 原生压缩守卫
+
+dsh-tui 0.14.x 把 `standard` / `ptc` / `cordis` 预设挂成内存里的 `PresetTree`，预设中的 `compaction-basic` 行不经过宿主 Loader，所以 `internal/config` 里的“按 name 禁用行”根本看不到它们。插件改为在 `agent/created`（以及 `agent/pre-step` 兜底）拿到该 agent 预设的 `compaction` 服务，patch 掉 `compactIfNeeded` / `compactNow`：
+
+- 自动压缩返回 `null`，不会在插件背后再折一次 surface；
+- 手写 `/compact` 抛一个真正的 `ManualCompactionError`（`code: 'cancelled'`，错误类从 profile 的 `@deepseek-ai/dsh-compaction` 解析；解析不到时退化为同名同 `code` 的 `Error`），`/compact` 会显示 “Compaction cancelled.”，而不是两套压缩同时写 `compaction/summary`；
+- 同一个预设里的 `toolResultPruner` 也会被 patch：`pruneContent` 返回 `null`、`pruneSession` 返回空结果，防止重新启用剪枝的构建绕过守卫改写 surface。
+
+如果宿主没有 `agentPresets` 服务（例如精简 profile），插件会尝试从该 agent 自己的 preset context 读取 `compaction` 服务；两者都拿不到时才打一条 warning 并保持原生压缩不动——此时应把 `disableNativeCompaction` 设为 `false`，或自行确认只保留一套压缩。`minimal` 预设本身不带 compaction 服务，不会触发这条路径。
+
 ## 工具的行为
 
-`acp_status` 默认打印两段：内核的体检报告（用量、活跃 block、token 分布），以及**当前可压区间**——这一段直接取内核 nudge 用的那份推荐（`NudgeDecision.compressibleRanges`，经 `formatRanges` 渲染），所以每一行里的 ref 都是 `compress` 当场会接受的。
+`acp_status` 默认打印两段：内核的体检报告（用量、活跃 block、token 分布），以及**当前可压区间**——这一段直接取内核 nudge 用的那份推荐（`NudgeDecision.compressibleRanges`，经 `formatRanges` 渲染），所以每一行里的 ref 通常都能被 `compress` 当场接受。唯一例外是手动把区间截在一条多 block 事件的中间：`compress` 会明确要求覆盖整条事件，而不是遮掉未摘要的 sibling。另一层过滤是 dsh surface：如果区间里的消息已经被另一个压缩器（原生 checkpoint 或别的插件）折掉，`acp_status` 会把该行隐藏并注明 “no longer on the current dsh surface”，避免模型先写摘要再被 `commit` 拒绝。
 
 这一点是刻意做的：内核自己的 `scope: 'uncompressed'` 明细按“可见消息”分组，而受保护消息（system / developer prompt、媒体）在 ref 空间里是字面量 `BLOCKED`，分组跨过它们时会打印出 `BLOCKED–m000NN` 这种不可用的区间。本插件默认视图不暴露它；显式传 `scope` 查明细时，这些行也会被替换成一行说明。
 
@@ -75,11 +88,14 @@ dsh 的 `agent/pre-step` 没有“临时消息”通道：listener 返回的任�
 
 ## 安装
 
+插件以 dsh-tui Community v0.15 插件形式发布：仓库根目录带 `dsh-plugin.json`，`facets.host.entry` 指向已提交的 `dist/index.js`，因此从 GitHub 克隆后不需要再构建：
+
 ```powershell
-dsh plugin --profile dsh-tui add link:D:/Code_Works/Js/dsh-tui-bili-compaction
+git clone https://github.com/MomentDerek/dsh-tui-bili-compaction.git
+dsh plugin --profile dsh-tui add link:<克隆目录>
 ```
 
-包自带 `cordis.patch.yml`（`dsh.bundle.patch`），loader 会插入 `bili-compaction` 行。装完重启 dsh-tui。
+安装前可以用 `/plugins check <克隆目录>/dsh-plugin.json` 验证清单。包同时自带 `cordis.patch.yml`（`dsh.bundle.patch`），loader 会插入 `bili-compaction` 行；装完重启 dsh-tui。
 
 和 `billion-context` 同时装着也能跑，但两者都会压缩：要交给本插件，就把 `billion-context` 从 `dsh.profile.bundles` 里去掉（或至少让它的 `dsh-native` 不接管）。
 
@@ -89,20 +105,36 @@ dsh plugin --profile dsh-tui add link:D:/Code_Works/Js/dsh-tui-bili-compaction
 $env:NODE_ENV = "development"
 npm install --include=dev   # 生产环境会跳过 devDependencies
 npm run build               # tsc -p tsconfig.json
+npm run check:manifest      # 验证 dsh-plugin.json 与入口
 npm test                    # node --test tests/*.test.mjs
 ```
 
+发布前请重新 `npm run build` 并提交 `dist/`；GitHub 安装直接使用仓库里的构建产物。
+
 内核在 `vendor/acp-kernel/`，是从 `billion-context` 仓库 `kernel/` 构建并拷入的产物（`dist/` + `.d.ts`）。升级内核：在 billion-context 里 `npm run build --workspace` 后重拷 `kernel/dist`。
+
+## 出处与许可
+
+本插件以 MIT 许可开源。
+
+压缩引擎使用 **acp-kernel** 与 **billion-context**：
+
+- <https://github.com/ranxianglei/acp-kernel>
+- <https://github.com/ranxianglei/billion-context>
+
+`vendor/acp-kernel/` 是上述项目的未修改构建产物，采用 MIT + 附加署名条款；完整的第三方许可与署名要求见 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。
 
 ## 已知边界
 
-- `modelContextLimit` 靠配置：dsh 的 `GenerateOptions` / `EpochHeader` 里没有上下文窗口字段。
-- 压缩区间只能落在 `m00002` 之后（内核保留第一段 user 开场），以及 `preserveRecentMessages` / `preserveRecentTokens` 之外——默认最后 3 条消息、5000 token 不许折，所以“刚贴进来的长文”要等下一轮才进区间。
+- `modelContextLimit` 可配置；未显式配置时插件读 `session.requestContext().contextWindow`，路由未通告窗口时回退 1M。显式配置的值始终优先，不会被路由通告的更大窗口覆盖。
+- 压缩区间只能落在 `m00002` 之后（内核保留第一段 user 开场），以及 `preserveRecentMessages` / `preserveRecentTokens` 之外——默认最后 3 条消息、5000 token 不许折，所以“刚贴进来的长文”要等下一轮才进区间。这个保护现在对显式 `compress` 也生效：内核自己计算保护 ref，插件不再传错类型的 `protectedMessageIds`。
 - 单区间字符数要过内核的 `compress.minCompressRange`（默认 5000 字符），太短会直接被拒；小会话压不动是内核策略，不是插件 bug。
-- `commit` 会拒绝任何“遮蔽区间里出现该 block 未覆盖的可见消息”的提交，并把原因回给模型：宁可少折，不做半折叠。
+- `commit` 会先规划整批替换：任何区间若“遮蔽区间里出现该 block 未覆盖的可见消息”或“只覆盖一条多 block 事件的一部分”，整批拒绝且不写 durable replacement、不保存内核状态，不会留下一个假 active block。宁可少折，不做半折叠。
 - 和 `billion-context` 同时加载时两边工具同名（`compress` / `decompress` / `acp_status`），只能留一个。
+- 状态 JSON 现在会逐项校验 block 与 contentStore：损坏的 block 会被丢弃，坏掉的 contentStore 回退为空；但这不是加密或版本迁移机制，跨大版本升级仍建议手动清一次状态目录。
+- `acp_reset` 清空 LSM 时会扫描日志里已有的 `acp_block_bN` checkpoint，把 `nextBlockId` 推到最大值之后，避免重置后再次生成重复的 message id。
 
 ## 验证状态
 
-- `npm test`：7 个用例，覆盖 store 往返/损坏回退、原生压缩行剥离、append-origin 视图与 ref 编号、durable replace 提交、未知 ref 拒绝、以及「`acp_status` 给出的 ref 必须能被 `compress` 当场接受」的回归。
+- `npm test`：17 个用例，覆盖 store 归一化/损坏回退、原生压缩行剥离与 preset 服务守卫（compaction + toolResultPruner）、`ManualCompactionError` 解析、preset context 兜底、append-origin 视图与 ref 编号、durable replace 提交、未知 ref 拒绝、多 block 事件的半覆盖拒绝、失败提交不落 active block、显式 compress 不吃保护尾、动态窗口识别、只读状态不推进 nudge、reset 不重用 block id、`acp_status` 隐藏已被 surface 折掉的区间，以及「给出的 ref 必须能被 `compress` 当场接受」的回归。
 - 真实 dsh 会话（headless profile，`preserveRecentMessages: 0`）：`acp_status` → `compress` 一次成功，dsh 日志落下 `surfaceOp: 'replace'`，token meter 随之下降；插件状态文件里出现 `b1 m00009–m00017 3374 tokens`。

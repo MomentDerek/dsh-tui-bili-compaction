@@ -1,0 +1,1 @@
+{"version":3,"file":"util.d.ts","sourceRoot":"","sources":["../../src/wire/util.ts"],"names":[],"mappings":"AAEA;;0CAE0C;AAC1C,wBAAgB,MAAM,CAAC,CAAC,EAAE,MAAM,GAAG,MAAM,CAExC;AAED;;6CAE6C;AAC7C,MAAM,MAAM,oBAAoB,GAAG;IACjC,KAAK,EAAE,MAAM,CAAC;IACd,MAAM,EACF,QAAQ,GACR,cAAc,GACd,kBAAkB,GAClB,mBAAmB,GACnB,qBAAqB,GACrB,WAAW,CAAC;IAChB,cAAc,EAAE,OAAO,CAAC;CACzB,CAAC"}

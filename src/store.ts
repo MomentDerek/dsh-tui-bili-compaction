@@ -42,6 +42,136 @@ function emptySession(): PersistedSession {
   return { version: STORE_VERSION, state: createInitialState(), contentStore: createContentStore() }
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function stringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((entry) => typeof entry === 'string')
+}
+
+function finite(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value)
+}
+
+function normalizeBlock(value: unknown): boolean {
+  if (!isRecord(value)) return false
+  if (typeof value['blockId'] !== 'string' || value['blockId'].length === 0) return false
+  if (typeof value['runId'] !== 'string' || typeof value['summary'] !== 'string') return false
+  if (value['tier'] !== 1 && value['tier'] !== 2 && value['tier'] !== 3) return false
+  if (value['generation'] !== 'young' && value['generation'] !== 'old') return false
+  if (!stringArray(value['directMessageIds'])) return false
+  if (!stringArray(value['effectiveMessageIds'])) return false
+  if (!stringArray(value['directBlockIds'])) return false
+  if (!finite(value['compressedTokens']) || !finite(value['createdAt']) || !finite(value['survivedCount'])) return false
+  return typeof value['active'] === 'boolean'
+}
+
+function normalizeRefs(value: unknown): CompressionState['messageRefs'] | undefined {
+  if (!isRecord(value) || !isRecord(value['byRaw']) || !isRecord(value['byRef'])) return undefined
+  const byRaw = Object.fromEntries(
+    Object.entries(value['byRaw']).filter((entry): entry is [string, string] => typeof entry[1] === 'string'),
+  )
+  const byRef = Object.fromEntries(
+    Object.entries(value['byRef']).filter((entry): entry is [string, string] => typeof entry[1] === 'string'),
+  )
+  return { byRaw, byRef }
+}
+
+function normalizeContentStore(value: unknown): MessageContentStore {
+  if (!isRecord(value) || !isRecord(value['byHash']) || !isRecord(value['byRef'])) return createContentStore()
+  const byHash = Object.fromEntries(
+    Object.entries(value['byHash']).filter((entry): entry is [string, string] => typeof entry[1] === 'string'),
+  )
+  const byRef = Object.fromEntries(
+    Object.entries(value['byRef']).filter((entry): entry is [string, MessageContentStore['byRef'][string]] => {
+      const entryValue = entry[1]
+      return (
+        isRecord(entryValue) &&
+        typeof entryValue['ref'] === 'string' &&
+        typeof entryValue['rawId'] === 'string' &&
+        typeof entryValue['text'] === 'string' &&
+        typeof entryValue['kind'] === 'string' &&
+        finite(entryValue['tokens']) &&
+        typeof entryValue['head'] === 'string'
+      )
+    }),
+  )
+  return { version: 1, byHash, byRef }
+}
+
+function positiveInt(value: unknown, fallback: number): number {
+  return finite(value) && value >= 1 ? Math.floor(value) : fallback
+}
+
+function normalizeState(value: unknown): CompressionState {
+  const initial = createInitialState()
+  if (!isRecord(value)) return initial
+  const refs = normalizeRefs(value['messageRefs'])
+  if (refs === undefined || !Array.isArray(value['blocks'])) return initial
+  const seen = new Set<string>()
+  const blocks = value['blocks'].filter((block): block is CompressionState['blocks'][number] => {
+    if (!normalizeBlock(block)) return false
+    const id = (block as { blockId: string }).blockId
+    if (seen.has(id)) return false
+    seen.add(id)
+    return true
+  })
+  const highestBlockId = blocks.reduce((highest, block) => {
+    const match = /^b(\d+)$/.exec(block.blockId)
+    return match === null ? highest : Math.max(highest, Number(match[1]))
+  }, 0)
+  const tokenSnapshot = isRecord(value['tokenSnapshot'])
+    ? Object.fromEntries(
+        Object.entries(value['tokenSnapshot']).filter((entry): entry is [string, number] => finite(entry[1])),
+      )
+    : initial.tokenSnapshot
+  const nudgeValue = value['nudge']
+  const nudge =
+    isRecord(nudgeValue) &&
+    finite(nudgeValue['lastPerMessageNudgeTokens']) &&
+    finite(nudgeValue['lastNudgeShownTokens']) &&
+    finite(nudgeValue['baselineTokens']) &&
+    isRecord(nudgeValue['anchors'])
+      ? {
+          lastPerMessageNudgeTokens: nudgeValue['lastPerMessageNudgeTokens'],
+          lastNudgeShownTokens: nudgeValue['lastNudgeShownTokens'],
+          baselineTokens: nudgeValue['baselineTokens'],
+          anchors: Object.fromEntries(
+            Object.entries(nudgeValue['anchors']).filter((entry): entry is [string, number] => finite(entry[1])),
+          ),
+          lastShownByTier: isRecord(nudgeValue['lastShownByTier'])
+            ? (Object.fromEntries(
+                Object.entries(nudgeValue['lastShownByTier']).filter((entry): entry is [string, number] =>
+                  finite(entry[1]),
+                ),
+              ) as Record<number, number>)
+            : initial.nudge.lastShownByTier,
+        }
+      : initial.nudge
+  const statsValue = value['stats']
+  const stats = isRecord(statsValue)
+    ? {
+        ...initial.stats,
+        ...Object.fromEntries(
+          Object.entries(statsValue).filter((entry): entry is [string, number] => finite(entry[1])),
+        ),
+      }
+    : initial.stats
+  return {
+    ...initial,
+    ...value,
+    blocks,
+    messageRefs: refs,
+    tokenSnapshot,
+    nudge,
+    stats,
+    nextBlockId: Math.max(positiveInt(value['nextBlockId'], initial.nextBlockId), highestBlockId + 1),
+    nextRunId: positiveInt(value['nextRunId'], initial.nextRunId),
+    nextRuleId: positiveInt(value['nextRuleId'], initial.nextRuleId ?? 1),
+  } as CompressionState
+}
+
 export class SessionStore {
   private readonly dir: string
   private readonly cache = new Map<string, PersistedSession>()
@@ -77,20 +207,11 @@ export class SessionStore {
   }
 
   private normalize(parsed: unknown): PersistedSession {
-    if (typeof parsed !== 'object' || parsed === null) return emptySession()
-    const record = parsed as { version?: unknown; state?: unknown; contentStore?: unknown }
-    const state = record.state
-    const contentStore = record.contentStore
-    const validState =
-      typeof state === 'object' &&
-      state !== null &&
-      Array.isArray((state as { blocks?: unknown }).blocks) &&
-      typeof (state as { messageRefs?: unknown }).messageRefs === 'object'
-    const validStore = typeof contentStore === 'object' && contentStore !== null
+    if (!isRecord(parsed)) return emptySession()
     return {
       version: STORE_VERSION,
-      state: validState ? (state as CompressionState) : createInitialState(),
-      contentStore: validStore ? (contentStore as MessageContentStore) : createContentStore(),
+      state: normalizeState(parsed['state']),
+      contentStore: normalizeContentStore(parsed['contentStore']),
     }
   }
 
@@ -108,8 +229,11 @@ export class SessionStore {
     }
   }
 
-  reset(sessionId: string): PersistedSession {
+  reset(sessionId: string, nextBlockId?: number): PersistedSession {
     const fresh = emptySession()
+    if (nextBlockId !== undefined && nextBlockId > fresh.state.nextBlockId) {
+      fresh.state.nextBlockId = nextBlockId
+    }
     this.save(sessionId, fresh)
     return fresh
   }
