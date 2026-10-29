@@ -1,14 +1,16 @@
 import type { Config } from './kernel.js';
 /**
- * Plugin options live in the profile's plugin config; every field is optional
- * and falls back to a value that is safe for a 1M-token model.
+ * Plugin options live in the profile's plugin config; every field is optional.
+ * The defaults are the standing operating policy: nudge from 20% of the
+ * window, auto-fold at 40%, fold back down to 20%.
  */
 export interface PluginOptions {
     /** Pin the route context window. When omitted, the engine prefers the live
      *  session's advertised window and only falls back to 1M. Set this when the
      *  route advertises a window larger than the budget you want to enforce. */
     modelContextLimit?: number;
-    /** Additional kernel config (tiers, nudge, truncate, ccr, ...). */
+    /** Additional kernel config (tiers, nudge, truncate, ccr, ...). Merged over
+     *  the plugin defaults below, which are merged over the kernel's own. */
     kernel?: Partial<Config>;
     /** Disable the live preset's `compaction` service (`compactIfNeeded` /
      *  `compactNow`) so only this engine compresses. Default true. */
@@ -19,13 +21,14 @@ export interface PluginOptions {
     /** Append the kernel's language-preservation rule to every summary prompt. */
     languagePreservation?: boolean;
     /** Append the kernel's nudge to the durable log on every step. dsh has no
-     *  ephemeral message channel, so this writes a real `user/message` event and
-     *  is off by default; the same text is available through `acp_status`. */
+     *  ephemeral message channel, so this writes a real `user/message` event.
+     *  Default true; set it to false for a silent engine driven by `acp_status`. */
     injectNudge?: boolean;
     /** Automatic folding without a model call: when the measured surface passes
      *  `triggerPct` of the window, the plugin condenses the oldest visible
-     *  messages into one durable checkpoint with a mechanical digest. Off by
-     *  default; folding replaces surface content, so opt in deliberately. */
+     *  messages into one durable checkpoint with a mechanical digest. Default
+     *  enabled at 40% → 20%; folding replaces surface content, so a profile that
+     *  wants to keep the raw surface can switch it off deliberately. */
     autoFold?: AutoFoldOptions;
 }
 /** Thresholds for the model-free `autoFold` path. */

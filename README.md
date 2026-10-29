@@ -58,11 +58,11 @@ dsh 的 model-visible surface 本身是一次折叠。如果内核也只看 surf
     disableNativeCompaction: true # 默认 true：拦掉预设内 compaction 的“主动压力压缩”与手写 /compact，保留溢出恢复
     storageDir: null             # 默认 LOCALAPPDATA 下的插件状态目录
     languagePreservation: false  # 摘要保留原文语言
-    injectNudge: false           # 见下
-    autoFold:                    # 模型无关的自动折叠，默认关闭
-      enabled: false
-      triggerPct: 0.2            # 越过窗口的 20% 就开始折
-      targetPct: 0.1             # 折回到 10%（受 preserveRecentMessages/Tokens 保护尾约束）
+    injectNudge: true            # 默认 true：把内核 nudge 追加进会话，见下
+    autoFold:                    # 模型无关的自动折叠，默认开启
+      enabled: true
+      triggerPct: 0.4            # 越过窗口的 40% 就开始折
+      targetPct: 0.2             # 折回到 20%（受 preserveRecentMessages/Tokens 保护尾约束）
     kernel: {}                   # 透传给内核 defaultConfig(modelContextLimit, overrides)
 ```
 
@@ -97,11 +97,13 @@ dsh-tui 0.14.x 把 `standard` / `ptc` / `cordis` 预设挂成内存里的 `Prese
 
 `compress` 的参数就是内核的 schema（`content` 放 JSON 字符串或对象数组，一次调用折完所有区间）。被拒时内核会在错误里附带当前的合法区间。
 
-## 为什么默认不注入 nudge
+## nudge 与自动折叠的默认节奏
 
-dsh 的 `agent/pre-step` 没有“临时消息”通道：listener 返回的任何消息都会被 `agent-loop` 追加进 durable log。所以内核的 nudge 默认不写进会话，模型通过 `acp_status` 拿到同样的信息（当前用量、可压区间、活跃 block）——一次工具调用，零日志污染。把 `injectNudge` 打开才会在每一步追加一条 `source.kind = 'bili-compaction-nudge'` 的 user 消息。
+插件默认就按 `injectNudge: true` 运行：dsh 的 `agent/pre-step` 没有“临时消息”通道，listener 返回的任何消息都会被 `agent-loop` 追加进 durable log，所以这一步会在每一步追加一条 `source.kind = 'bili-compaction-nudge'` 的 user 消息——这是唯一能让模型在下一轮就看到用量压力的通道。不想污染日志就显式写 `injectNudge: false`，此时模型只能通过 `acp_status` 拿到同样的信息（当前用量、可压区间、活跃 block）。
 
-**不注入时插件不会自己压缩**：内核只“建议”折叠，真正的 `compress` 由模型发起（或 dsh 原生在压力/溢出时动手）。所以如果希望它在使用量到达某个比例时自动催着模型压缩，就要同时打开 `injectNudge` 并调低 nudge 曲线：
+**自动折叠兜底**：`autoFold` 默认在 40% 触发、折回 20%，不花模型调用；要保留原始 surface 就写 `autoFold: { enabled: false }`。
+
+想自己调 nudge 曲线（下面的值只是覆盖示例，括号里才是默认）：
 
 ```yaml
 - id: bili-compaction
@@ -109,9 +111,9 @@ dsh 的 `agent/pre-step` 没有“临时消息”通道：listener 返回的任�
     injectNudge: true
     kernel:
       nudge:
-        minContextLimitPct: 0.2      # 默认 0.45：越过 20% 就开始提醒
-        maxContextLimitPct: 0.6      # 默认 0.75
-        emergencyThresholdPct: 0.85  # 默认 0.95
+        minContextLimitPct: 0.3      # 默认 0.2：越过 30% 才开始提醒
+        maxContextLimitPct: 0.5      # 默认 0.4
+        emergencyThresholdPct: 0.7   # 默认 0.5
 ```
 
 未被投递的 nudge 不会推进内核的“已提醒”水位（`advanceNudge: false`），所以关掉 `injectNudge` 期间错过的提醒会在重新打开后立刻补上，而不是被静默吞掉。

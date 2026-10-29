@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import test from 'node:test'
 import { pathToFileURL } from 'node:url'
 
-import { resolveOptions } from '../dist/config.js'
+import { buildKernelConfig, resolveOptions } from '../dist/config.js'
 import { CompactionEngine } from '../dist/engine.js'
 import { apply, stripNativeCompaction } from '../dist/index.js'
 import { createContentStore, createInitialState } from '../dist/kernel.js'
@@ -795,12 +795,12 @@ test('autoFold condenses the oldest visible messages without a model call', () =
   }
 })
 
-test('autoFold stays off unless enabled', () => {
+test('autoFold can be switched off', () => {
   const dir = temporaryDir()
   try {
     const session = new FakeSession()
     for (let index = 0; index < 16; index += 1) session.push(userMessage(`u${index}`, filler(3000)))
-    const options = resolveOptions({ storageDir: dir, modelContextLimit: 40_000 })
+    const options = resolveOptions({ storageDir: dir, modelContextLimit: 40_000, autoFold: { enabled: false } })
     const engine = new CompactionEngine(options, new SessionStore(dir))
     assert.equal(engine.autoFold(session, { totalTokens: 30_000, surfaceTokens: 30_000, nodes: [] }), null)
     assert.equal(session.surfaceNodes.length, 16)
@@ -876,4 +876,27 @@ test('compress rejects an unknown ref instead of folding the log', () => {
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
+})
+
+test('defaults ship the 20/40/20 policy', () => {
+  const options = resolveOptions(undefined)
+  assert.equal(options.injectNudge, true)
+  assert.deepEqual(options.autoFold, { enabled: true, triggerPct: 0.4, targetPct: 0.2 })
+  assert.equal(options.disableNativeCompaction, true)
+
+  const config = buildKernelConfig(options)
+  assert.equal(config.nudge.minContextLimitPct, 0.2)
+  assert.equal(config.nudge.maxContextLimitPct, 0.4)
+  assert.equal(config.nudge.emergencyThresholdPct, 0.5)
+  assert.equal(config.nudge.growthFloor, 20_000)
+  assert.equal(config.nudge.growthCap, 20_000)
+  // Kernel defaults the plugin does not touch survive the merge.
+  assert.equal(config.nudge.frequency, 5)
+  assert.equal(config.nudge.force, 'soft')
+})
+
+test('an explicit kernel nudge still wins over the plugin default', () => {
+  const config = buildKernelConfig(resolveOptions({ kernel: { nudge: { minContextLimitPct: 0.3 } } }))
+  assert.equal(config.nudge.minContextLimitPct, 0.3)
+  assert.equal(config.nudge.maxContextLimitPct, 0.4)
 })
