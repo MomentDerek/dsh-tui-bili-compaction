@@ -1,4 +1,4 @@
-import { buildKernelConfig } from './config.js';
+import { buildKernelConfig, resolveGrowthGate } from './config.js';
 import { SUMMARY_HEADER, activeBlocks, baseIdOf, blockById, buildStatusReport, collectBlockContent, createCore, defaultCountTokens, estimateTokensFast, formatRanges, parseBlockIdArg, parseCompressArgs, renderNudgeText, resolvePrompts, validateConfig, } from './kernel.js';
 import { SessionStore } from './store.js';
 import { BLOCK_SOURCE_KIND, buildKernelView, isOwnMessage, renderBlockSummary } from './session-view.js';
@@ -174,9 +174,13 @@ export class CompactionEngine {
         }
     }
     configFor(view, modelContextLimit = this.config.modelContextLimit) {
+        // The growth gate scales with the live window, not with the 1M default
+        // baked into this.config, so a 200K route is not held to a 1M floor.
+        const growth = resolveGrowthGate(this.config.nudge, modelContextLimit);
         return {
             ...this.config,
             modelContextLimit,
+            nudge: { ...this.config.nudge, ...growth },
             isMessageProtected: (message) => view.protectedIds.has(message.id),
         };
     }

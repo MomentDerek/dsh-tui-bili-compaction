@@ -1,5 +1,5 @@
 import type { ResolvedOptions } from './config.js'
-import { buildKernelConfig } from './config.js'
+import { buildKernelConfig, resolveGrowthGate } from './config.js'
 import type {
   CompressionBlock,
   CompressionCore,
@@ -246,9 +246,13 @@ export class CompactionEngine {
   }
 
   private configFor(view: KernelView, modelContextLimit = this.config.modelContextLimit): Config {
+    // The growth gate scales with the live window, not with the 1M default
+    // baked into this.config, so a 200K route is not held to a 1M floor.
+    const growth = resolveGrowthGate(this.config.nudge, modelContextLimit)
     return {
       ...this.config,
       modelContextLimit,
+      nudge: { ...this.config.nudge, ...growth },
       isMessageProtected: (message) => view.protectedIds.has(message.id),
     }
   }

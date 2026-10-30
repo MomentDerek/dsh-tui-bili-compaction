@@ -50,15 +50,32 @@ const DEFAULT_TRIGGER_PCT = 0.4
 const DEFAULT_TARGET_PCT = 0.2
 
 /** Nudge cadence the plugin runs on: warn from 20%, press from 40%, emergency
- *  at 50%, with a 20K-token growth floor so short turns do not re-nudge. The
- *  kernel's own defaults are 0.45 / 0.75 / 0.95 with 50K floors. */
+ *  at 50%. The growth gate is proportional to the window: `growthRatio` 0.1
+ *  with a 20K floor, so a 1M window re-nudges every ~10% while a small window
+ *  still gets the short-turn floor. The cap is wide enough not to flatten the
+ *  ratio on large windows. */
 const DEFAULT_NUDGE = {
   minContextLimitPct: 0.2,
   maxContextLimitPct: 0.4,
   emergencyThresholdPct: 0.5,
   growthFloor: 2e4,
-  growthCap: 2e4,
+  growthCap: 1e6,
+  growthRatio: 0.1,
 } satisfies Partial<Config['nudge']>
+
+/** Resolve the growth gate for one window: keep the operator's floor/cap, but
+ *  let the ratio win on large windows. Returns the pair the kernel reads as
+ *  both the T1 compressible-mass threshold and the re-nudge increment. */
+export function resolveGrowthGate(
+  nudge: Config['nudge'],
+  modelContextLimit: number,
+): { floor: number; cap: number } {
+  const growth = Math.min(
+    nudge.growthCap,
+    Math.max(nudge.growthFloor, Math.round(modelContextLimit * nudge.growthRatio)),
+  )
+  return { floor: growth, cap: growth }
+}
 
 export interface ResolvedOptions {
   modelContextLimit: number

@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import test from 'node:test'
 import { pathToFileURL } from 'node:url'
 
-import { buildKernelConfig, resolveOptions } from '../dist/config.js'
+import { buildKernelConfig, resolveGrowthGate, resolveOptions } from '../dist/config.js'
 import { CompactionEngine } from '../dist/engine.js'
 import { apply, stripNativeCompaction } from '../dist/index.js'
 import { createContentStore, createInitialState } from '../dist/kernel.js'
@@ -888,15 +888,42 @@ test('defaults ship the 20/40/20 policy', () => {
   assert.equal(config.nudge.minContextLimitPct, 0.2)
   assert.equal(config.nudge.maxContextLimitPct, 0.4)
   assert.equal(config.nudge.emergencyThresholdPct, 0.5)
+  assert.equal(config.nudge.growthRatio, 0.1)
   assert.equal(config.nudge.growthFloor, 20_000)
-  assert.equal(config.nudge.growthCap, 20_000)
+  assert.equal(config.nudge.growthCap, 1_000_000)
   // Kernel defaults the plugin does not touch survive the merge.
   assert.equal(config.nudge.frequency, 5)
   assert.equal(config.nudge.force, 'soft')
+})
+
+test('the growth gate scales with the window', () => {
+  const { nudge } = buildKernelConfig(resolveOptions(undefined))
+  // 10% of the window once it clears the 20K floor, so a 1M route no longer
+  // re-nudges every 2% the way a fixed 20K cap made it.
+  assert.deepEqual(resolveGrowthGate(nudge, 1_000_000), { floor: 100_000, cap: 100_000 })
+  assert.deepEqual(resolveGrowthGate(nudge, 200_000), { floor: 20_000, cap: 20_000 })
+  assert.deepEqual(resolveGrowthGate(nudge, 4_000_000), { floor: 400_000, cap: 400_000 })
 })
 
 test('an explicit kernel nudge still wins over the plugin default', () => {
   const config = buildKernelConfig(resolveOptions({ kernel: { nudge: { minContextLimitPct: 0.3 } } }))
   assert.equal(config.nudge.minContextLimitPct, 0.3)
   assert.equal(config.nudge.maxContextLimitPct, 0.4)
+})
+
+test('a 1M window does not nudge at 4% of the window', () => {
+  const dir = temporaryDir()
+  try {
+    const session = new FakeSession()
+    for (let index = 0; index < 10; index += 1) session.push(userMessage(`u${index}`, filler(20000)))
+    const options = resolveOptions({ storageDir: dir, modelContextLimit: 1_000_000 })
+    const engine = new CompactionEngine(options, new SessionStore(dir))
+    engine.refresh(session, { totalTokens: 10_000, surfaceTokens: 10_000, nodes: [] })
+    const refreshed = engine.refresh(session, { totalTokens: 40_000, surfaceTokens: 40_000, nodes: [] })
+    // The old fixed 20K gate treated 30K of growth as enough on a 1M route;
+    // the proportional gate needs ~45K of growth and 100K of T1 mass.
+    assert.equal(refreshed.decision?.shouldInject, false)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 })

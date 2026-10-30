@@ -40,6 +40,13 @@ export interface AutoFoldOptions {
     targetPct?: number;
 }
 export declare const DEFAULT_MODEL_CONTEXT_LIMIT = 1000000;
+/** Resolve the growth gate for one window: keep the operator's floor/cap, but
+ *  let the ratio win on large windows. Returns the pair the kernel reads as
+ *  both the T1 compressible-mass threshold and the re-nudge increment. */
+export declare function resolveGrowthGate(nudge: Config['nudge'], modelContextLimit: number): {
+    floor: number;
+    cap: number;
+};
 export interface ResolvedOptions {
     modelContextLimit: number;
     /** True when the operator pinned `modelContextLimit`; otherwise the live

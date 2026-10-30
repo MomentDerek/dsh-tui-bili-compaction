@@ -1,6 +1,6 @@
 {
   "name": "dsh-tui-bili-compaction",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "dsh-TUI 专用上下文压缩：在 dsh 进程内直接运行 billion-context 内核（acp-kernel 的 3-tier LSM），替代 bili 代理级压缩。",
   "type": "module",
   "main": "./dist/index.js",

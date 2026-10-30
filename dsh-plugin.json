@@ -3,7 +3,7 @@
   "manifestVersion": "0.15",
   "id": "momentderek.dsh-tui-bili-compaction",
   "name": "dsh-TUI bili compaction",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "facets": {
     "host": {
       "entry": "dist/index.js",
