@@ -49,9 +49,25 @@ class FakeSession {
     if (surfaceOp === 'append') {
       this.surfaceNodes.push(seq)
     } else if (surfaceOp !== undefined && typeof surfaceOp === 'object') {
+      // Mirror `@deepseek-ai/dsh-session` exactly: the surface is a *positional*
+      // list, so a replacement is located with `indexOf` and spliced in place.
+      // The new node keeps the seq it was appended with (always the log tail),
+      // which is why surface seq numbers are not monotonic. Filtering by seq
+      // value here would hide every range that straddles an older replacement.
       const { startSeq, endSeq } = surfaceOp
-      this.surfaceNodes = this.surfaceNodes.filter((node) => node < startSeq || node > endSeq)
-      this.surfaceNodes.push(seq)
+      const startIdx = this.surfaceNodes.indexOf(startSeq)
+      const endIdx = this.surfaceNodes.indexOf(endSeq)
+      if (startIdx < 0 || endIdx < 0 || startIdx > endIdx) {
+        throw new Error(`surface replace: range ${startSeq}-${endSeq} is not a live positional span`)
+      }
+      // `assertSourceEventReferences` in @deepseek-ai/dsh-session: every node the
+      // positional span shadows must be cited, or the append is refused.
+      const sources = new Set(options?.sourceEventSeqs ?? [])
+      const missing = this.surfaceNodes.slice(startIdx, endIdx + 1).filter((node) => !sources.has(node))
+      if (missing.length > 0) {
+        throw new Error(`surface replace: sourceEventSeqs must include every shadowed surface node; missing ${missing.join(', ')}`)
+      }
+      this.surfaceNodes.splice(startIdx, endIdx - startIdx + 1, seq)
     }
     return { seq }
   }
@@ -428,8 +444,9 @@ test('compress commits a durable surface replacement and decompress restores it'
     assert.match(replacement.data.content[0].text, /^\[Compressed conversation section\]/)
     assert.match(replacement.data.content[0].text, /Key Technical Concepts/)
 
-    // dsh's own fold: the replaced nodes leave the surface, one takes their place.
-    assert.deepEqual(session.surfaceNodes, [0, 4, 5, 6, 7])
+    // dsh's own fold: the replaced nodes leave the surface, and the checkpoint
+    // takes their *position* (its seq is the log tail, so seqs stop being sorted).
+    assert.deepEqual(session.surfaceNodes, [0, 7, 4, 5, 6])
 
     const blockId = replacement.data.source.blockId
     assert.match(blockId, /^b\d+$/)
@@ -448,6 +465,59 @@ test('compress commits a durable surface replacement and decompress restores it'
     assert.equal(again.tokenCount > 0, true)
     assert.equal(session.events.filter((event) => typeof event.surfaceOp === 'object').length, 1)
     assert.match(engine.status(session), new RegExp(blockId))
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+/**
+ * Regression: `compress` used to translate a block into a seq *value* range
+ * (`seq >= min && seq <= max`). dsh's surface is positional, so an earlier
+ * checkpoint sits at its original index while carrying a seq from the log tail.
+ * A second fold that straddles it therefore spans nodes whose seq numbers fall
+ * outside the block's ref range, and the kernel rejected the replacement with
+ * `sourceEventSeqs must include every shadowed surface node`.
+ */
+test('a fold that straddles an older checkpoint is committed, not rejected', () => {
+  const dir = temporaryDir()
+  try {
+    const session = new FakeSession()
+    session.push(userMessage('u0', filler(600)))
+    session.push(userMessage('u1', filler(6000)))
+    session.push(assistantMessage('a1', filler(6000)))
+    session.push(userMessage('u2', filler(6000)))
+    session.push(assistantMessage('a2', filler(6000)))
+    session.push(userMessage('u3', filler(6000)))
+    session.push(assistantMessage('a3', filler(6000)))
+
+    const options = resolveOptions({
+      storageDir: dir,
+      modelContextLimit: 400_000,
+      kernel: { preserveRecentMessages: 0, preserveRecentTokens: 0 },
+    })
+    const engine = new CompactionEngine(options, new SessionStore(dir))
+    engine.refresh(session)
+
+    const first = engine.compress(session, {
+      content: JSON.stringify([{ startId: 'm00003', endId: 'm00004', summary: '## First\nfirst fold covers the opening exchange so the second fold can straddle it' }]),
+    })
+    assert.equal(first.ok, true, first.text)
+    // The checkpoint takes position 2 and carries seq 7 (the log tail).
+    assert.deepEqual(session.surfaceNodes, [0, 1, 7, 4, 5, 6])
+
+    const second = engine.compress(session, {
+      content: JSON.stringify([
+        { startId: 'm00002', endId: 'm00006', summary: '## Second\nstraddles the first checkpoint and must cite its seq 7 node' },
+      ]),
+    })
+    assert.equal(second.ok, true, second.text)
+
+    const replacements = session.events.filter((event) => typeof event.surfaceOp === 'object')
+    const straddling = replacements[replacements.length - 1]
+    // The kernel requires every shadowed surface node to be cited, including
+    // the checkpoint seq 7 that lives *inside* the positional span.
+    assert.equal(straddling.sourceEventSeqs.includes(7), true, JSON.stringify(straddling.sourceEventSeqs))
+    assert.deepEqual(straddling.surfaceOp, { op: 'replace', startSeq: 1, endSeq: 5 })
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
@@ -586,14 +656,14 @@ test('a partial multi-block range is rejected before any durable write', () => {
     const replacements = session.events.filter((event) => typeof event.surfaceOp === 'object')
     assert.equal(replacements.length, 1)
     assert.deepEqual(replacements[0].surfaceOp, { op: 'replace', startSeq: 1, endSeq: 1 })
-    assert.deepEqual(session.surfaceNodes, [0, 2, 3])
+    assert.deepEqual(session.surfaceNodes, [0, 3, 2])
     assert.equal(engine.decompress(session, replacements[0].data.source.blockId).includes('lorem ipsum'), true)
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
 })
 
-test('a rejected commit does not persist an active block', () => {
+test('a protected message splits the fold instead of rejecting it', () => {
   const dir = temporaryDir()
   try {
     const session = new FakeSession()
@@ -618,32 +688,80 @@ test('a rejected commit does not persist an active block', () => {
     const engine = new CompactionEngine(options, store)
     engine.refresh(session)
 
-    const rejected = engine.compress(session, {
+    const split = engine.compress(session, {
       content: JSON.stringify([
         {
           startId: 'm00001',
           endId: 'm00003',
-          summary: '## Rejected\nA media-bearing message sits in the middle and must keep this fold from landing.',
+          summary: '## Split\nA media-bearing message sits in the middle; the fold lands on both sides of it.',
         },
       ]),
     })
-    assert.equal(rejected.ok, false)
-    assert.match(rejected.text, /the span contains img/)
-    assert.equal(session.events.filter((event) => typeof event.surfaceOp === 'object').length, 0)
-    assert.deepEqual(store.load(session.id).state.blocks, [])
+    assert.equal(split.ok, true, split.text)
 
-    // The failed batch must not make the older messages look covered.
-    const retry = engine.compress(session, {
+    const replacements = session.events.filter((event) => typeof event.surfaceOp === 'object')
+    assert.equal(replacements.length, 2)
+    assert.deepEqual(replacements[0].surfaceOp, { op: 'replace', startSeq: 0, endSeq: 0 })
+    assert.deepEqual(replacements[1].surfaceOp, { op: 'replace', startSeq: 2, endSeq: 2 })
+    // The image message never moves: only its neighbours are folded.
+    assert.deepEqual(session.surfaceNodes, [3, 1, 4])
+    assert.equal(replacements[0].data.source.blockId, replacements[1].data.source.blockId)
+    assert.match(replacements[1].data.content[0].text, /continuation of/)
+
+    assert.equal(store.load(session.id).state.blocks.length, 1)
+    assert.equal(engine.decompress(session, replacements[0].data.source.blockId).includes('lorem ipsum'), true)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('a segment write failure does not leave an active block behind', () => {
+  const dir = temporaryDir()
+  try {
+    const session = new FakeSession()
+    session.push(userMessage('u1', filler(6000)))
+    session.push({
+      id: 'img',
+      role: 'user',
+      content: [
+        { type: 'text', text: 'look at this image' },
+        { type: 'image', data: 'base64-image-bytes' },
+      ],
+      source: { kind: 'user' },
+    })
+    session.push(userMessage('u2', filler(6000)))
+
+    const options = resolveOptions({
+      storageDir: dir,
+      modelContextLimit: 40_000,
+      kernel: { preserveRecentMessages: 0, preserveRecentTokens: 0 },
+    })
+    const store = new SessionStore(dir)
+    const engine = new CompactionEngine(options, store)
+    engine.refresh(session)
+
+    const append = session.append.bind(session)
+    let writes = 0
+    session.append = (type, data, opts) => {
+      if (opts !== undefined && typeof opts.surfaceOp === 'object') {
+        writes += 1
+        if (writes === 2) throw new Error('disk full')
+      }
+      return append(type, data, opts)
+    }
+
+    const failed = engine.compress(session, {
       content: JSON.stringify([
         {
           startId: 'm00001',
-          endId: 'm00001',
-          summary: '## Retry\nOnly the first user message is folded now; the image message remains visible.',
+          endId: 'm00003',
+          summary: '## Failure\nThe second segment cannot land, so the block must not stay active.',
         },
       ]),
     })
-    assert.equal(retry.ok, true, retry.text)
-    assert.equal(session.events.filter((event) => typeof event.surfaceOp === 'object').length, 1)
+    assert.equal(failed.ok, false)
+    assert.match(failed.text, /disk full/)
+    assert.deepEqual(store.load(session.id).state.blocks, [])
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

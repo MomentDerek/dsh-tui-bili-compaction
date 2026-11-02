@@ -108,11 +108,20 @@ export declare class CompactionEngine {
     /**
      * Validate one durable replacement without writing it.
      *
-     * The critical check is not just "does the block cover the event's base id":
-     * the block must cover every kernel core id of that event. `assignRefs` gives
-     * each core its own ref (same `ledgerSeq`, different free ref), so a range can
-     * legitimately select only one core; committing it would shadow the whole
-     * event and silently drop the unselected siblings.
+     * dsh's surface is a *positional* fold: `replacementRange` locates `startSeq`
+     * and `endSeq` with `indexOf` and slices by index, and a landed replacement
+     * keeps the seq it was appended with (always the log tail) while sitting at
+     * the index it replaced. Surface seq numbers are therefore not monotonic, and
+     * any seq *value* range is the wrong model: a re-fold that straddles an older
+     * checkpoint always contains a node whose seq is far outside `[minSeq,
+     * maxSeq]`, which the kernel then reports as `sourceEventSeqs must include
+     * every shadowed surface node`. Plan by index instead.
+     *
+     * The second half of the check is informational: a span may contain a node
+     * this block does not cover. dsh can only shadow one contiguous run, so the
+     * node splits the span into segments that are committed separately. The block
+     * still opens only on messages it covers, and every segment cites exactly the
+     * nodes it will shadow.
      */
     private planCommit;
     /**

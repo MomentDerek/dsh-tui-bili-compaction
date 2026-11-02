@@ -40,13 +40,25 @@ export interface CompressOutcome {
   ok: boolean
 }
 
-/** A validated durable replacement; nothing is written until every block plans cleanly. */
-interface CommitPlan {
-  block: CompressionBlock
+/** One contiguous positional span a single durable replacement can shadow. */
+interface CommitSegment {
   startSeq: number
   endSeq: number
   shadowed: number[]
+}
+
+/** A validated durable replacement; nothing is written until every block plans cleanly. */
+interface CommitPlan {
+  block: CompressionBlock
+  /**
+   * dsh replacements are positional and contiguous. A block whose span contains
+   * a message it cannot cover (protected tail, withdrawn tool-call pair, foreign
+   * message) is split here instead of being refused outright.
+   */
+  segments: CommitSegment[]
   text: string
+  /** Replacement copy for every segment after the first. */
+  continuedText: string
 }
 
 /** Optional drill-down for `acp_status`; mirrors the kernel's report options. */
@@ -536,12 +548,12 @@ export class CompactionEngine {
       ids.add(message.id)
     }
 
-    const plans: CommitPlan[] = []
+    const plans: CompressionBlock[] = []
     const problems = new Map<string, string>()
     for (const block of created) {
       const planned = this.planCommit(session, view, block, coresByBase)
       if ('problem' in planned) problems.set(block.blockId, planned.problem)
-      else plans.push(planned)
+      else plans.push(block)
     }
 
     if (problems.size > 0) {
@@ -558,21 +570,35 @@ export class CompactionEngine {
     }
 
     const committed: CompressionBlock[] = []
-    for (const plan of plans) {
+    for (const block of plans) {
       try {
-        session.append(
-          'user/message',
-          {
-            id: `acp_block_${plan.block.blockId}`,
-            role: 'user',
-            content: [{ type: 'text', text: plan.text }],
-            source: { kind: BLOCK_SOURCE_KIND, blockId: plan.block.blockId },
-          },
-          { surfaceOp: { op: 'replace', startSeq: plan.startSeq, endSeq: plan.endSeq }, sourceEventSeqs: plan.shadowed },
-        )
-        committed.push(plan.block)
+        // Re-plan against the live surface. Earlier blocks in this batch already
+        // landed, and each of them replaced its span with one node whose seq is
+        // the log tail. A span planned before those writes can therefore cite a
+        // node set that no longer matches what dsh will shadow, which is the
+        // batch-order half of the "not compressible" failures.
+        const plan = this.planCommit(session, view, block, coresByBase)
+        if ('problem' in plan) throw new Error(plan.problem)
+        for (const [index, segment] of plan.segments.entries()) {
+          session.append(
+            'user/message',
+            {
+              // dsh keeps one node per replacement, so a split block writes one
+              // node per segment; the block id stays shared for decompress.
+              id: `acp_block_${block.blockId}_${index}`,
+              role: 'user',
+              content: [{ type: 'text', text: index === 0 ? plan.text : plan.continuedText }],
+              source: { kind: BLOCK_SOURCE_KIND, blockId: block.blockId },
+            },
+            {
+              surfaceOp: { op: 'replace', startSeq: segment.startSeq, endSeq: segment.endSeq },
+              sourceEventSeqs: segment.shadowed,
+            },
+          )
+        }
+        committed.push(block)
       } catch (error) {
-        problems.set(plan.block.blockId, error instanceof Error ? error.message : String(error))
+        problems.set(block.blockId, error instanceof Error ? error.message : String(error))
       }
     }
 
@@ -601,11 +627,20 @@ export class CompactionEngine {
   /**
    * Validate one durable replacement without writing it.
    *
-   * The critical check is not just "does the block cover the event's base id":
-   * the block must cover every kernel core id of that event. `assignRefs` gives
-   * each core its own ref (same `ledgerSeq`, different free ref), so a range can
-   * legitimately select only one core; committing it would shadow the whole
-   * event and silently drop the unselected siblings.
+   * dsh's surface is a *positional* fold: `replacementRange` locates `startSeq`
+   * and `endSeq` with `indexOf` and slices by index, and a landed replacement
+   * keeps the seq it was appended with (always the log tail) while sitting at
+   * the index it replaced. Surface seq numbers are therefore not monotonic, and
+   * any seq *value* range is the wrong model: a re-fold that straddles an older
+   * checkpoint always contains a node whose seq is far outside `[minSeq,
+   * maxSeq]`, which the kernel then reports as `sourceEventSeqs must include
+   * every shadowed surface node`. Plan by index instead.
+   *
+   * The second half of the check is informational: a span may contain a node
+   * this block does not cover. dsh can only shadow one contiguous run, so the
+   * node splits the span into segments that are committed separately. The block
+   * still opens only on messages it covers, and every segment cites exactly the
+   * nodes it will shadow.
    */
   private planCommit(
     session: DshSessionLike,
@@ -617,36 +652,56 @@ export class CompactionEngine {
     const coveredBases = new Set<string>()
     for (const id of coveredIds) coveredBases.add(baseIdOf(id))
 
-    const surface = session.surface.nodes
-    let minSeq = Number.POSITIVE_INFINITY
-    let maxSeq = Number.NEGATIVE_INFINITY
+    const nodes = session.surface.nodes
+    const positionOf = new Map<number, number>()
+    for (let index = 0; index < nodes.length; index += 1) {
+      const seq = nodes[index]
+      if (seq !== undefined) positionOf.set(seq, index)
+    }
+
+    let firstIndex = Number.POSITIVE_INFINITY
+    let lastIndex = Number.NEGATIVE_INFINITY
     for (const id of block.effectiveMessageIds) {
       const seq = view.seqOf.get(id)
       if (seq === undefined) continue
-      if (seq < minSeq) minSeq = seq
-      if (seq > maxSeq) maxSeq = seq
+      const index = positionOf.get(seq)
+      if (index === undefined) continue
+      if (index < firstIndex) firstIndex = index
+      if (index > lastIndex) lastIndex = index
     }
-    if (!Number.isFinite(minSeq) || !Number.isFinite(maxSeq)) {
-      return { problem: 'no surface sequence is mapped to this block' }
+    if (!Number.isFinite(firstIndex) || !Number.isFinite(lastIndex) || lastIndex < firstIndex) {
+      return { problem: 'the block covers no currently visible message' }
     }
 
-    const shadowed: number[] = []
-    for (const seq of surface) if (seq >= minSeq && seq <= maxSeq) shadowed.push(seq)
-    if (shadowed.length === 0) return { problem: 'the block covers no currently visible message' }
+    const segments: CommitSegment[] = []
+    let current: number[] = []
+    const flush = (): void => {
+      const head = current[0]
+      const tail = current[current.length - 1]
+      if (head !== undefined && tail !== undefined) segments.push({ startSeq: head, endSeq: tail, shadowed: [...current] })
+      current = []
+    }
 
-    const startSeq = shadowed[0]
-    const endSeq = shadowed[shadowed.length - 1]
-    if (startSeq === undefined || endSeq === undefined) return { problem: 'the block covers no currently visible message' }
-
-    for (const seq of shadowed) {
+    for (const seq of nodes.slice(firstIndex, lastIndex + 1)) {
       const event = session.eventAt(seq)
       const message = session.deriveEventMessage(event)
       if (message === null || message === undefined) return { problem: `visible node #${seq} derives no message` }
-      if (isOwnMessage(message)) continue
+      if (isOwnMessage(message)) {
+        // A checkpoint this plugin wrote earlier: its originals are still in the
+        // kernel store, so folding it again loses nothing and keeps the span
+        // contiguous across a re-fold.
+        current.push(seq)
+        continue
+      }
       const base = typeof message.id === 'string' ? message.id : undefined
       if (base === undefined) return { problem: `visible node #${seq} has no durable message id` }
       if (!coveredBases.has(base)) {
-        return { problem: `the span contains ${base} which this block does not cover; compress a narrower range` }
+        // Protected tail, withdrawn tool-call pair or a foreign message: it stays
+        // visible, so the current segment ends before it and the next one opens
+        // after it. Refusing the whole block here is exactly what made large
+        // re-folds look "not compressible".
+        flush()
+        continue
       }
       const expected = coresByBase.get(base)
       if (expected !== undefined) {
@@ -657,14 +712,17 @@ export class CompactionEngine {
           }
         }
       }
+      current.push(seq)
     }
+    flush()
+
+    if (segments.length === 0) return { problem: 'the block covers no currently visible message' }
 
     return {
       block,
-      startSeq,
-      endSeq,
-      shadowed,
+      segments,
       text: renderBlockSummary(SUMMARY_HEADER, block.summary, block.topic),
+      continuedText: renderBlockSummary(SUMMARY_HEADER, `(continuation of ${block.blockId}; originals are stored with its first segment)`, block.topic),
     }
   }
 
