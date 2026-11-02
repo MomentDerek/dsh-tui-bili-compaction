@@ -33,7 +33,7 @@ dsh 的 model-visible surface 本身是一次折叠。如果内核也只看 surf
 
 - 只增不减 → block 覆盖的 id 永远在视图里，`syncBlocks` 不会把块判死。
 - `ledgerSeq = dshSeq + 1` → 一个事件的第一条消息 ref 等于 `m{dshSeq+1}`，一个会话内永久稳定（`assignRefs` 直接采信 `ledgerSeq`）。一条 dsh 事件可能带多个 content block（reasoning + text + tool-call），兄弟 block 会占用后续空闲 ref；`compress` 必须覆盖整条事件的所有 block，否则会被拒绝，避免只摘要了 text 却把 reasoning 一起遮掉。
-- 本插件自己写入的摘要/提示消息带 `source.kind = 'bili-compaction'`，重建视图时排除，不会被二次压缩。
+- 本插件自己写入的摘要/提示消息带 `source.kind = 'bili-compaction'`，重建视图时排除，不会被二次压缩。跨块折叠时，别的 checkpoint 与 nudge 只作为分段边界保留在 surface 上，不会被吞进新摘要——否则它覆盖的原文在内核里仍算已压缩，新摘要又没看过它们，那段内容就从上下文里彻底消失。
 
 ## 组件
 
@@ -41,10 +41,11 @@ dsh 的 model-visible surface 本身是一次折叠。如果内核也只看 surf
 | --- | --- |
 | `src/index.ts` | 插件入口（`name = 'bili-compaction'`）；原生压缩守卫（patch preset 内 `compaction` 服务）；注册工具 |
 | `src/session-view.ts` | dsh 日志 → `CoreMessage[]`（append-origin、`ledgerSeq`、保护集） |
-| `src/engine.ts` | `refresh` / `compress` / `decompress` / `status`：内核状态与 durable replace 的桥 |
+| `src/engine.ts` | `refresh` / `compress` / `decompress` / `status`：内核状态与 durable replace 的桥；按位置规划折叠、把跨不过去的节点切成多段写入 |
 | `src/tools.ts` | `compress` / `decompress` / `acp_status` 三个 dsh 工具（schema 直接复用内核常量） |
 | `src/store.ts` | 每会话 JSON 状态（`$LOCALAPPDATA\dsh-tui-bili-compaction\sessions`），原子写 |
 | `src/config.ts` | 插件选项 → 内核 `Config` |
+| `src/repeat-guard.ts` | `llm/stream` waterfall：截断复读尝试，并在 `agent/request-error` 上限次重试 |
 | `src/dsh-types.ts` | dsh 侧的鸭子类型（profile 插件解析不到 `@deepseek-ai/*`） |
 
 ## 选项
@@ -63,6 +64,13 @@ dsh 的 model-visible surface 本身是一次折叠。如果内核也只看 surf
       enabled: true
       triggerPct: 0.4            # 越过窗口的 40% 就开始折
       targetPct: 0.2             # 折回到 20%（受 preserveRecentMessages/Tokens 保护尾约束）
+    repeatGuard:                 # 单次尝试内的复读闸门，默认开启
+      enabled: true
+      minRepeatedLines: 16       # 同一行连续出现多少次就截断
+      minChars: 200              # 这次尝试至少产出多少字符才允许触发
+      maxRetries: 1              # 截断后重发几次；0 表示只截断不重试
+      maxLineChars: 40           # 超过这个长度的重复行算内容（表格行），不算复读
+      maxUniqueLines: 2          # 触发时最近窗口里允许的不同行数
     kernel: {}                   # 透传给内核 defaultConfig(modelContextLimit, overrides)
 ```
 
@@ -74,8 +82,16 @@ dsh 的 model-visible surface 本身是一次折叠。如果内核也只看 surf
 
 - 摘要里**没有模型参与**，所以细节会丢：适合“先把窗口压下去继续干活”，不适合代替人工整理的总结；
 - 折叠范围永远避开 `preserveRecentMessages` / `preserveRecentTokens` 保护的尾部（当前这轮对话不会被折）；
-- 插件自己写的 checkpoint 不会被再次折叠，避免“摘要的摘要”；
+- 别的 checkpoint 不会被吞并：折叠区间跨过它时，它把区间切成两段，自己留在 surface 上；
 - 折掉的原文仍在 append-only 日志里，但 `decompress` 只认内核 block，这类 checkpoint 只能靠日志回溯。
+
+## 复读闸门：`llm/stream`
+
+压缩只能保证不把复读喂回模型，压不住发生在单次尝试内部的退化。`repeatGuard` 直接挂在 `llm/stream` 这个 waterfall 上，逐块检查 `reasoning-delta` 与 `text-delta`：同一行连续出现 `minRepeatedLines`（默认 16）次、且这次尝试已经产出 `minChars`（默认 200）字符，就用一个 `error` finish 结束这次尝试——上游迭代器随之关闭，剩下的预算不再被烧掉。纯结构行（`}`、`---`）不计入，重复行还必须短于 `maxLineChars`（默认 40 字符），且最近 64 行里不同行不超过 `maxUniqueLines`（默认 2）——表格、Yes/No 列这类结构化重复因此不会被误判。真正的复读是一两句短话洗版，窗口里几乎只剩它自己。
+
+结束不是目的，重来才是：`agent/request-error` 收到 `REPETITION_LOOP` 后返回 `{ kind: 'retry' }`，`agent-loop` 重发同一条请求。重试按 agent 计次（默认 1 次），`agent/status` 回到 `idle` 时清零；超限后让失败保持终态，而不是无限重发。被截断的尝试只落 `assistant/attempt`，不进 surface，所以复读文本不会变成下一轮的模仿样本。
+
+代价要说清楚：重试等于把整条上下文再发一遍，400K 的会话重试一次就是再一次 400K 输入。默认只重试一次正是因为这个；只想截断不想重试就设 `maxRetries: 0`。
 
 ## 原生压缩守卫
 
@@ -96,6 +112,8 @@ dsh-tui 0.14.x 把 `standard` / `ptc` / `cordis` 预设挂成内存里的 `Prese
 这一点是刻意做的：内核自己的 `scope: 'uncompressed'` 明细按“可见消息”分组，而受保护消息（system / developer prompt、媒体）在 ref 空间里是字面量 `BLOCKED`，分组跨过它们时会打印出 `BLOCKED–m000NN` 这种不可用的区间。本插件默认视图不暴露它；显式传 `scope` 查明细时，这些行也会被替换成一行说明。
 
 `compress` 的参数就是内核的 schema（`content` 放 JSON 字符串或对象数组，一次调用折完所有区间）。被拒时内核会在错误里附带当前的合法区间。
+
+折叠区间里夹着它折不动的东西（受保护消息、媒体、别的压缩器的 checkpoint）时，`compress` 不再整块拒绝，而是把区间切成多段分别落地：每段一个 `user/message`，id 为 `acp_block_bN_<段号>`，`source.blockId` 共用同一个块，`decompress` 仍然整块恢复。每段都写**完整摘要**（第 2 段起加一行 `(segment k/n of bN)`），不是指向首段的占位符——分段后靠后的那段可能离工作尾部更近，占位符等于让模型看不见这次折叠。段写失败时，已经落地的段留在 surface 上，块也保留在内核状态里，重试不会撞上“covers no currently visible message”这种永久死结。
 
 ## nudge 与自动折叠的默认节奏
 

@@ -3,6 +3,7 @@ import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import type { PluginOptions } from './config.js'
 import { resolveOptions } from './config.js'
+import { installRepeatGuard } from './repeat-guard.js'
 import type {
   DshAgentLike,
   DshAgentPresetsLike,
@@ -450,6 +451,7 @@ function installStepHook(
 
 export function apply(ctx: PluginContext, rawConfig?: PluginOptions): void {
   const options = resolveOptions(rawConfig)
+  installRepeatGuard(ctx, options.repeatGuard)
   const engine = new CompactionEngine(options, new SessionStore(options.storageDir))
   const nativeGuard = options.disableNativeCompaction ? installNativeCompactionGuard(ctx) : undefined
   if (nativeGuard !== undefined) {

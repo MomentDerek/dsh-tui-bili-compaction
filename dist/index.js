@@ -2,6 +2,7 @@ import { createRequire } from 'node:module';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { resolveOptions } from './config.js';
+import { installRepeatGuard } from './repeat-guard.js';
 import { CompactionEngine } from './engine.js';
 import { SessionStore } from './store.js';
 import { registerTools } from './tools.js';
@@ -387,6 +388,7 @@ function installStepHook(ctx, engine, injectNudge, autoFold, getMeter, nativeGua
 }
 export function apply(ctx, rawConfig) {
     const options = resolveOptions(rawConfig);
+    installRepeatGuard(ctx, options.repeatGuard);
     const engine = new CompactionEngine(options, new SessionStore(options.storageDir));
     const nativeGuard = options.disableNativeCompaction ? installNativeCompactionGuard(ctx) : undefined;
     if (nativeGuard !== undefined) {

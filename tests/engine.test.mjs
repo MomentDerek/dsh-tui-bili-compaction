@@ -478,7 +478,7 @@ test('compress commits a durable surface replacement and decompress restores it'
  * outside the block's ref range, and the kernel rejected the replacement with
  * `sourceEventSeqs must include every shadowed surface node`.
  */
-test('a fold that straddles an older checkpoint is committed, not rejected', () => {
+test('a fold that straddles an older checkpoint keeps that checkpoint visible', () => {
   const dir = temporaryDir()
   try {
     const session = new FakeSession()
@@ -495,7 +495,8 @@ test('a fold that straddles an older checkpoint is committed, not rejected', () 
       modelContextLimit: 400_000,
       kernel: { preserveRecentMessages: 0, preserveRecentTokens: 0 },
     })
-    const engine = new CompactionEngine(options, new SessionStore(dir))
+    const store = new SessionStore(dir)
+    const engine = new CompactionEngine(options, store)
     engine.refresh(session)
 
     const first = engine.compress(session, {
@@ -513,11 +514,19 @@ test('a fold that straddles an older checkpoint is committed, not rejected', () 
     assert.equal(second.ok, true, second.text)
 
     const replacements = session.events.filter((event) => typeof event.surfaceOp === 'object')
-    const straddling = replacements[replacements.length - 1]
-    // The kernel requires every shadowed surface node to be cited, including
-    // the checkpoint seq 7 that lives *inside* the positional span.
-    assert.equal(straddling.sourceEventSeqs.includes(7), true, JSON.stringify(straddling.sourceEventSeqs))
-    assert.deepEqual(straddling.surfaceOp, { op: 'replace', startSeq: 1, endSeq: 5 })
+    assert.equal(replacements.length, 3)
+    const [left, right] = replacements.slice(1)
+    // The earlier checkpoint sits between the two halves. It is someone else's
+    // summary, so it splits the span instead of being swallowed: folding it
+    // would erase the only remaining copy of what it covered.
+    assert.deepEqual(left.surfaceOp, { op: 'replace', startSeq: 1, endSeq: 1 })
+    assert.deepEqual(right.surfaceOp, { op: 'replace', startSeq: 4, endSeq: 5 })
+    assert.equal(left.data.source.blockId, right.data.source.blockId)
+    assert.equal(session.surfaceNodes.includes(7), true, JSON.stringify(session.surfaceNodes))
+    assert.equal(store.load(session.id).state.blocks.length, 2)
+    // Every segment carries the full summary, not a pointer to the first one.
+    assert.match(right.data.content[0].text, /segment 2\/2 of b2\b/)
+    assert.match(right.data.content[0].text, /straddles the first checkpoint/)
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
@@ -706,7 +715,9 @@ test('a protected message splits the fold instead of rejecting it', () => {
     // The image message never moves: only its neighbours are folded.
     assert.deepEqual(session.surfaceNodes, [3, 1, 4])
     assert.equal(replacements[0].data.source.blockId, replacements[1].data.source.blockId)
-    assert.match(replacements[1].data.content[0].text, /continuation of/)
+    // The second segment repeats the summary instead of pointing at the first.
+    assert.match(replacements[1].data.content[0].text, /segment 2\/2 of b1\b/)
+    assert.match(replacements[1].data.content[0].text, /A media-bearing message sits in the middle/)
 
     assert.equal(store.load(session.id).state.blocks.length, 1)
     assert.equal(engine.decompress(session, replacements[0].data.source.blockId).includes('lorem ipsum'), true)
@@ -715,7 +726,7 @@ test('a protected message splits the fold instead of rejecting it', () => {
   }
 })
 
-test('a segment write failure does not leave an active block behind', () => {
+test('a transient segment failure is repaired in the same call', () => {
   const dir = temporaryDir()
   try {
     const session = new FakeSession()
@@ -745,7 +756,62 @@ test('a segment write failure does not leave an active block behind', () => {
     session.append = (type, data, opts) => {
       if (opts !== undefined && typeof opts.surfaceOp === 'object') {
         writes += 1
-        if (writes === 2) throw new Error('disk full')
+        if (writes === 2) throw new Error('transient disk error')
+      }
+      return append(type, data, opts)
+    }
+
+    const applied = engine.compress(session, {
+      content: JSON.stringify([
+        {
+          startId: 'm00001',
+          endId: 'm00003',
+          summary: '## Failure\nThe second segment fails once, then the repair writes it.',
+        },
+      ]),
+    })
+    assert.equal(applied.ok, true, applied.text)
+    const replacements = session.events.filter((event) => typeof event.surfaceOp === 'object')
+    assert.equal(replacements.length, 2)
+    assert.equal(replacements[0].data.source.blockId, replacements[1].data.source.blockId)
+    assert.equal(store.load(session.id).state.blocks.length, 1)
+    assert.equal(session.surfaceNodes.length, 3)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('a persistent segment failure keeps the block and says the range is spent', () => {
+  const dir = temporaryDir()
+  try {
+    const session = new FakeSession()
+    session.push(userMessage('u1', filler(6000)))
+    session.push({
+      id: 'img',
+      role: 'user',
+      content: [
+        { type: 'text', text: 'look at this image' },
+        { type: 'image', data: 'base64-image-bytes' },
+      ],
+      source: { kind: 'user' },
+    })
+    session.push(userMessage('u2', filler(6000)))
+
+    const options = resolveOptions({
+      storageDir: dir,
+      modelContextLimit: 40_000,
+      kernel: { preserveRecentMessages: 0, preserveRecentTokens: 0 },
+    })
+    const store = new SessionStore(dir)
+    const engine = new CompactionEngine(options, store)
+    engine.refresh(session)
+
+    const append = session.append.bind(session)
+    let writes = 0
+    session.append = (type, data, opts) => {
+      if (opts !== undefined && typeof opts.surfaceOp === 'object') {
+        writes += 1
+        if (writes >= 2) throw new Error('disk full')
       }
       return append(type, data, opts)
     }
@@ -755,13 +821,74 @@ test('a segment write failure does not leave an active block behind', () => {
         {
           startId: 'm00001',
           endId: 'm00003',
-          summary: '## Failure\nThe second segment cannot land, so the block must not stay active.',
+          summary: '## Failure\nThe second segment cannot land, and the repair fails too.',
         },
       ]),
     })
     assert.equal(failed.ok, false)
     assert.match(failed.text, /disk full/)
-    assert.deepEqual(store.load(session.id).state.blocks, [])
+    assert.match(failed.text, /PARTIAL/)
+    assert.match(failed.text, /partial: 1 of 2 segments landed/)
+    assert.match(failed.text, /acp_reset/)
+
+    // The first segment is on the surface, so its originals are gone from the
+    // positional view. The kernel has to remember the block; otherwise the next
+    // attempt plans against nodes that no longer exist.
+    assert.equal(store.load(session.id).state.blocks.length, 1)
+    assert.equal(session.surfaceNodes.length, 3)
+    assert.equal(session.surfaceNodes.includes(1), true, JSON.stringify(session.surfaceNodes))
+
+    session.append = append
+    const retry = engine.compress(session, {
+      content: JSON.stringify([
+        {
+          startId: 'm00001',
+          endId: 'm00003',
+          summary: '## Retry\nThis must not be diagnosed as a block that covers no visible message.',
+        },
+      ]),
+    })
+    assert.equal(retry.text.includes('covers no currently visible message'), false, retry.text)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('two blocks in one call each land against the surface the previous one left', () => {
+  const dir = temporaryDir()
+  try {
+    const session = new FakeSession()
+    session.push(userMessage('u1', filler(6000)))
+    session.push(assistantMessage('a1', filler(6000)))
+    session.push(userMessage('u2', filler(6000)))
+    session.push(assistantMessage('a2', filler(6000)))
+
+    const options = resolveOptions({
+      storageDir: dir,
+      modelContextLimit: 400_000,
+      kernel: { preserveRecentMessages: 0, preserveRecentTokens: 0 },
+    })
+    const store = new SessionStore(dir)
+    const engine = new CompactionEngine(options, store)
+    engine.refresh(session)
+
+    const applied = engine.compress(session, {
+      content: JSON.stringify([
+        { startId: 'm00001', endId: 'm00002', summary: '## A\nFirst range of the batch, kept long enough to pass the minimum summary length check.' },
+        { startId: 'm00003', endId: 'm00004', summary: '## B\nSecond range of the batch, planned against the surface the first write left behind.' },
+      ]),
+    })
+    assert.equal(applied.ok, true, applied.text)
+
+    const replacements = session.events.filter((event) => typeof event.surfaceOp === 'object')
+    assert.equal(replacements.length, 2)
+    assert.deepEqual(replacements[0].surfaceOp, { op: 'replace', startSeq: 0, endSeq: 1 })
+    // After the first replacement the surface is [4, 2, 3]; the second block
+    // must plan against that, not against the pre-batch node list.
+    assert.deepEqual(replacements[1].surfaceOp, { op: 'replace', startSeq: 2, endSeq: 3 })
+    assert.deepEqual(session.surfaceNodes, [4, 5])
+    assert.equal(store.load(session.id).state.blocks.length, 2)
+    assert.match(replacements[1].data.content[0].text, /Second range of the batch/)
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
@@ -908,6 +1035,36 @@ test('autoFold condenses the oldest visible messages without a model call', () =
 
     // The retained tail is too small to fold again with a stale measurement.
     assert.equal(engine.autoFold(session, measurement), null)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('autoFold does not copy a repetition loop into the digest', () => {
+  const dir = temporaryDir()
+  try {
+    const session = new FakeSession()
+    // A collapsed turn: one short line repeated until the budget ran out.
+    session.push(assistantMessage('loop', '好。\n'.repeat(400)))
+    for (let index = 0; index < 16; index += 1) {
+      session.push(index % 2 === 0 ? userMessage(`u${index}`, filler(3000)) : assistantMessage(`a${index}`, filler(3000)))
+    }
+    const options = resolveOptions({
+      storageDir: dir,
+      modelContextLimit: 40_000,
+      autoFold: { enabled: true, triggerPct: 0.2, targetPct: 0.1 },
+    })
+    const engine = new CompactionEngine(options, new SessionStore(dir))
+    const folded = engine.autoFold(session, { totalTokens: 30_000, surfaceTokens: 30_000, nodes: [] })
+    assert.ok(folded, 'expected a fold')
+
+    const replacement = session.events.find((event) => event.surfaceOp?.op === 'replace')
+    assert.ok(replacement, 'expected a durable replacement')
+    const text = replacement.data.content.map((block) => block.text).join('\n')
+    // Copying the loop verbatim makes compaction the loop's delivery mechanism:
+    // the next turn reads it back as an example worth continuing.
+    assert.equal((text.match(/好。/g) ?? []).length, 0, text.slice(0, 400))
+    assert.match(text, /行重复内容，省略/)
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

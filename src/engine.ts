@@ -41,6 +41,9 @@ export interface CompressOutcome {
 }
 
 /** One contiguous positional span a single durable replacement can shadow. */
+/** How much of a summary a later segment repeats; a fold split N ways must not cost N copies. */
+const SEGMENT_REPEAT_CHARS = 600
+
 interface CommitSegment {
   startSeq: number
   endSeq: number
@@ -56,9 +59,12 @@ interface CommitPlan {
    * message) is split here instead of being refused outright.
    */
   segments: CommitSegment[]
+  /**
+   * Self-contained summary. Every segment repeats it: a split fold can leave
+   * the later segments closer to the working tail than the first one, and a
+   * placeholder there would hide the whole fold from the model.
+   */
   text: string
-  /** Replacement copy for every segment after the first. */
-  continuedText: string
 }
 
 /** Optional drill-down for `acp_status`; mirrors the kernel's report options. */
@@ -122,6 +128,49 @@ const DIGEST_NOISE_SOURCES: ReadonlySet<string> = new Set([
   'bili-compaction-nudge',
 ])
 
+/**
+ * A degenerate turn is one short line repeated until the budget runs out. Copying
+ * it into the digest verbatim is how a repetition loop survives compaction and
+ * gets re-read as a style guide, so collapse runs and drop turns that are almost
+ * entirely one line.
+ */
+function condenseRepeats(text: string): string {
+  const raw = text.split('\n').filter((line) => line.trim().length > 0)
+  if (raw.length === 0) return ''
+  const keys = raw.map((line) => line.trim())
+  // Only an exact single-line loop is worthless. Two alternating lines can be a
+  // Yes/No column or a table, and dropping it would lose real content.
+  if (raw.length >= 8 && new Set(keys).size === 1) return `（${raw.length} 行重复内容，省略）`
+  const out: string[] = []
+  let last: string | undefined
+  let count = 0
+  let first = ''
+  const flush = (): void => {
+    if (count > 0) out.push(count > 1 ? `${first} ×${count}` : first)
+    count = 0
+  }
+  for (let index = 0; index < raw.length; index += 1) {
+    const key = keys[index] ?? ''
+    if (key === last) {
+      count += 1
+      continue
+    }
+    flush()
+    last = key
+    first = raw[index] ?? ''
+    count = 1
+  }
+  flush()
+  return out.join('\n')
+}
+
+function segmentText(text: string, index: number, total: number, blockId: string): string {
+  if (index === 0) return text
+  const head = `(segment ${index + 1}/${total} of ${blockId})`
+  const body = text.length <= SEGMENT_REPEAT_CHARS ? text : `${text.slice(0, SEGMENT_REPEAT_CHARS)}…`
+  return `${head}\n\n${body}`
+}
+
 function digestMessages(messages: readonly DshMessage[]): string {
   const lines: string[] = []
   let pendingTools = new Map<string, number>()
@@ -153,7 +202,7 @@ function digestMessages(messages: readonly DshMessage[]): string {
     if (text.length > 0) {
       flushTools()
       const tail = toolNames.length === 0 ? '' : ` ${toolNames.map((name) => `[${name}]`).join('')}`
-      lines.push(`- 助手：${`${text}${tail}`.slice(0, 320)}`)
+      lines.push(`- 助手：${`${condenseRepeats(text)}${tail}`.slice(0, 320)}`)
     } else {
       // A step that only ran tools says nothing written down; summarize the
       // run instead of spending a line per call on `[pwsh]`.
@@ -570,7 +619,10 @@ export class CompactionEngine {
     }
 
     const committed: CompressionBlock[] = []
+    const partialIds = new Set<string>()
     for (const block of plans) {
+      let landed = 0
+      let total = 0
       try {
         // Re-plan against the live surface. Earlier blocks in this batch already
         // landed, and each of them replaced its span with one node whose seq is
@@ -579,6 +631,7 @@ export class CompactionEngine {
         // batch-order half of the "not compressible" failures.
         const plan = this.planCommit(session, view, block, coresByBase)
         if ('problem' in plan) throw new Error(plan.problem)
+        total = plan.segments.length
         for (const [index, segment] of plan.segments.entries()) {
           session.append(
             'user/message',
@@ -587,7 +640,12 @@ export class CompactionEngine {
               // node per segment; the block id stays shared for decompress.
               id: `acp_block_${block.blockId}_${index}`,
               role: 'user',
-              content: [{ type: 'text', text: index === 0 ? plan.text : plan.continuedText }],
+              content: [
+                {
+                  type: 'text',
+                  text: segmentText(plan.text, index, total, block.blockId),
+                },
+              ],
               source: { kind: BLOCK_SOURCE_KIND, blockId: block.blockId },
             },
             {
@@ -595,14 +653,57 @@ export class CompactionEngine {
               sourceEventSeqs: segment.shadowed,
             },
           )
+          landed += 1
         }
         committed.push(block)
       } catch (error) {
-        problems.set(block.blockId, error instanceof Error ? error.message : String(error))
+        const reason = error instanceof Error ? error.message : String(error)
+        if (landed > 0 && landed < total) {
+          // The originals behind the failed segments are still on the surface,
+          // and this is the last moment they can be shadowed: once the kernel
+          // saves the block, it believes the whole range is folded and no later
+          // compress call will plan them again. Retry the remainder once — an
+          // append failure is usually transient — and report it if it is not.
+          try {
+            const repair = this.planCommit(session, view, block, coresByBase)
+            if (!('problem' in repair)) {
+              for (const [index, segment] of repair.segments.entries()) {
+                session.append(
+                  'user/message',
+                  {
+                    id: `acp_block_${block.blockId}_r${index}`,
+                    role: 'user',
+                    content: [
+                      { type: 'text', text: segmentText(repair.text, index, repair.segments.length, block.blockId) },
+                    ],
+                    source: { kind: BLOCK_SOURCE_KIND, blockId: block.blockId },
+                  },
+                  {
+                    surfaceOp: { op: 'replace', startSeq: segment.startSeq, endSeq: segment.endSeq },
+                    sourceEventSeqs: segment.shadowed,
+                  },
+                )
+              }
+              committed.push(block)
+              continue
+            }
+          } catch {
+            // The repair failed too; fall through and keep the block so the
+            // segments that did land are not stranded in the kernel view.
+          }
+          committed.push(block)
+          partialIds.add(block.blockId)
+          problems.set(
+            block.blockId,
+            `${reason} (partial: ${landed} of ${total} segments landed; the remaining originals stay visible but are already counted as folded, so acp_reset is the only way to reclaim them)`,
+          )
+        } else {
+          problems.set(block.blockId, reason)
+        }
       }
     }
 
-    const allCommitted = committed.length === created.length
+    const allCommitted = committed.length === created.length && partialIds.size === 0
     if (allCommitted) {
       this.save(session, applied.state, contentStore)
     } else if (committed.length > 0) {
@@ -613,14 +714,16 @@ export class CompactionEngine {
 
     const lines = created.map((block) => {
       const problem = problems.get(block.blockId)
-      return problem === undefined
-        ? `- ${block.blockId} ${block.startRef}–${block.endRef} (tier ${block.tier}, ${describeTokens(block.compressedTokens)} tokens folded${block.topic === undefined ? '' : `, topic: ${block.topic}`})`
-        : `- ${block.blockId} ${block.startRef}–${block.endRef}: NOT committed — ${problem}`
+      if (problem === undefined) {
+        return `- ${block.blockId} ${block.startRef}–${block.endRef} (tier ${block.tier}, ${describeTokens(block.compressedTokens)} tokens folded${block.topic === undefined ? '' : `, topic: ${block.topic}`})`
+      }
+      const label = partialIds.has(block.blockId) ? 'PARTIAL' : 'NOT committed'
+      return `- ${block.blockId} ${block.startRef}–${block.endRef}: ${label} — ${problem}`
     })
     const usage = measurement === undefined ? '' : `\nContext is now ${describeTokens(measurement.totalTokens)} tokens (${Math.round((measurement.totalTokens / limit) * 100)}% of ${describeTokens(limit)}).`
     const body = allCommitted
       ? `Compressed ${created.length} range(s):\n${lines.join('\n')}${usage}`
-      : `Compressed ${committed.length} of ${created.length} range(s):\n${lines.join('\n')}${usage}`
+      : `Compressed ${committed.length - partialIds.size} of ${created.length} range(s):\n${lines.join('\n')}${usage}`
     return { ok: allCommitted && errors.length === 0, text: `${body}${warnings}${errors}` }
   }
 
@@ -687,10 +790,18 @@ export class CompactionEngine {
       const message = session.deriveEventMessage(event)
       if (message === null || message === undefined) return { problem: `visible node #${seq} derives no message` }
       if (isOwnMessage(message)) {
-        // A checkpoint this plugin wrote earlier: its originals are still in the
-        // kernel store, so folding it again loses nothing and keeps the span
-        // contiguous across a re-fold.
-        current.push(seq)
+        // Only this block's own earlier segments may be folded again: their
+        // originals are still in the kernel store, so rewriting them loses
+        // nothing. Any other checkpoint or nudge stays visible. Swallowing one
+        // would delete its summary from the surface while the kernel still
+        // treats the originals it covers as compressed, so the new summary is
+        // the only copy left — and it was written without seeing them.
+        const owner = (message.source as { blockId?: unknown } | undefined)?.blockId
+        if (owner === block.blockId) {
+          current.push(seq)
+          continue
+        }
+        flush()
         continue
       }
       const base = typeof message.id === 'string' ? message.id : undefined
@@ -722,7 +833,6 @@ export class CompactionEngine {
       block,
       segments,
       text: renderBlockSummary(SUMMARY_HEADER, block.summary, block.topic),
-      continuedText: renderBlockSummary(SUMMARY_HEADER, `(continuation of ${block.blockId}; originals are stored with its first segment)`, block.topic),
     }
   }
 

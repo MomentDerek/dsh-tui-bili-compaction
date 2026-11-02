@@ -1,5 +1,6 @@
 import type { Config } from './kernel.js'
 import { defaultConfig } from './kernel.js'
+import { DEFAULT_REPEAT_GUARD, type RepeatGuardOptions } from './repeat-guard.js'
 
 /**
  * Plugin options live in the profile's plugin config; every field is optional.
@@ -32,6 +33,10 @@ export interface PluginOptions {
    *  enabled at 40% → 20%; folding replaces surface content, so a profile that
    *  wants to keep the raw surface can switch it off deliberately. */
   autoFold?: AutoFoldOptions
+  /** Cut a model attempt that collapses into a repetition loop and retry it
+   *  once. Compaction stops feeding the loop; this stops the loop itself.
+   *  Default enabled; the retry resends the request, so it is bounded. */
+  repeatGuard?: Partial<RepeatGuardOptions>
 }
 
 /** Thresholds for the model-free `autoFold` path. */
@@ -88,6 +93,7 @@ export interface ResolvedOptions {
   languagePreservation: boolean
   injectNudge: boolean
   autoFold: Required<AutoFoldOptions>
+  repeatGuard: RepeatGuardOptions
 }
 
 function ratio(value: unknown, fallback: number): number {
@@ -108,6 +114,24 @@ export function resolveOptions(raw: PluginOptions | undefined): ResolvedOptions 
     languagePreservation: raw?.languagePreservation === true,
     injectNudge: raw?.injectNudge !== false,
     autoFold: { enabled: raw?.autoFold?.enabled !== false, triggerPct, targetPct },
+    repeatGuard: resolveRepeatGuard(raw?.repeatGuard),
+  }
+}
+
+function positiveInt(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : fallback
+}
+
+function resolveRepeatGuard(raw: Partial<RepeatGuardOptions> | undefined): RepeatGuardOptions {
+  return {
+    enabled: raw?.enabled !== false,
+    minRepeatedLines: positiveInt(raw?.minRepeatedLines, DEFAULT_REPEAT_GUARD.minRepeatedLines),
+    minChars: positiveInt(raw?.minChars, DEFAULT_REPEAT_GUARD.minChars),
+    maxRetries: typeof raw?.maxRetries === 'number' && Number.isInteger(raw.maxRetries) && raw.maxRetries >= 0
+      ? raw.maxRetries
+      : DEFAULT_REPEAT_GUARD.maxRetries,
+    maxLineChars: positiveInt(raw?.maxLineChars, DEFAULT_REPEAT_GUARD.maxLineChars),
+    maxUniqueLines: positiveInt(raw?.maxUniqueLines, DEFAULT_REPEAT_GUARD.maxUniqueLines),
   }
 }
 

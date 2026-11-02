@@ -1,4 +1,5 @@
 import { defaultConfig } from './kernel.js';
+import { DEFAULT_REPEAT_GUARD } from './repeat-guard.js';
 export const DEFAULT_MODEL_CONTEXT_LIMIT = 1_000_000;
 /** Fold once the surface passes 40% of the window, back down to 20%. */
 const DEFAULT_TRIGGER_PCT = 0.4;
@@ -40,6 +41,22 @@ export function resolveOptions(raw) {
         languagePreservation: raw?.languagePreservation === true,
         injectNudge: raw?.injectNudge !== false,
         autoFold: { enabled: raw?.autoFold?.enabled !== false, triggerPct, targetPct },
+        repeatGuard: resolveRepeatGuard(raw?.repeatGuard),
+    };
+}
+function positiveInt(value, fallback) {
+    return typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : fallback;
+}
+function resolveRepeatGuard(raw) {
+    return {
+        enabled: raw?.enabled !== false,
+        minRepeatedLines: positiveInt(raw?.minRepeatedLines, DEFAULT_REPEAT_GUARD.minRepeatedLines),
+        minChars: positiveInt(raw?.minChars, DEFAULT_REPEAT_GUARD.minChars),
+        maxRetries: typeof raw?.maxRetries === 'number' && Number.isInteger(raw.maxRetries) && raw.maxRetries >= 0
+            ? raw.maxRetries
+            : DEFAULT_REPEAT_GUARD.maxRetries,
+        maxLineChars: positiveInt(raw?.maxLineChars, DEFAULT_REPEAT_GUARD.maxLineChars),
+        maxUniqueLines: positiveInt(raw?.maxUniqueLines, DEFAULT_REPEAT_GUARD.maxUniqueLines),
     };
 }
 export function buildKernelConfig(options) {

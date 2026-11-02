@@ -1,4 +1,5 @@
 import type { Config } from './kernel.js';
+import { type RepeatGuardOptions } from './repeat-guard.js';
 /**
  * Plugin options live in the profile's plugin config; every field is optional.
  * The defaults are the standing operating policy: nudge from 20% of the
@@ -30,6 +31,10 @@ export interface PluginOptions {
      *  enabled at 40% → 20%; folding replaces surface content, so a profile that
      *  wants to keep the raw surface can switch it off deliberately. */
     autoFold?: AutoFoldOptions;
+    /** Cut a model attempt that collapses into a repetition loop and retry it
+     *  once. Compaction stops feeding the loop; this stops the loop itself.
+     *  Default enabled; the retry resends the request, so it is bounded. */
+    repeatGuard?: Partial<RepeatGuardOptions>;
 }
 /** Thresholds for the model-free `autoFold` path. */
 export interface AutoFoldOptions {
@@ -58,6 +63,7 @@ export interface ResolvedOptions {
     languagePreservation: boolean;
     injectNudge: boolean;
     autoFold: Required<AutoFoldOptions>;
+    repeatGuard: RepeatGuardOptions;
 }
 export declare function resolveOptions(raw: PluginOptions | undefined): ResolvedOptions;
 export declare function buildKernelConfig(options: ResolvedOptions): Config;
