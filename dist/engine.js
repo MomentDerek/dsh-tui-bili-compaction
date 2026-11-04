@@ -273,7 +273,7 @@ export class CompactionEngine {
      */
     refresh(session, measurement, options = {}) {
         const synced = this.sync(session, measurement, options);
-        return { decision: synced.decision, tokenCount: synced.tokenCount };
+        return { decision: this.nudgeDecision(session, synced), tokenCount: synced.tokenCount };
     }
     /**
      * Model-free automatic folding, for hosts that want the request kept small
@@ -442,12 +442,12 @@ export class CompactionEngine {
     /**
      * Apply a `compress` tool call.
      *
-     * Every newly created block becomes one durable surface replacement. The whole
-     * batch is planned before the first append: if any block would split a dsh
-     * event, span an uncovered message, or otherwise cannot be represented, the
-     * call is rejected without writing a replacement and without persisting the
-     * kernel state. A failed commit must never leave an active block that covers
-     * messages still visible on dsh's surface.
+     * Every newly created block becomes one durable surface replacement. A block
+     * that cannot be represented (it splits a dsh event, covers no visible
+     * message, or cites a span an earlier fold already shadowed) is reported and
+     * skipped; the rest of the batch still commits. Only when nothing lands is the
+     * kernel state left unsaved, so a failed commit can never leave an active block
+     * that covers messages still visible on dsh's surface.
      */
     compress(session, rawArgs, measurement) {
         const parsed = parseCompressArgs(rawArgs);
@@ -493,24 +493,17 @@ export class CompactionEngine {
         const plans = [];
         const problems = new Map();
         for (const block of created) {
-            const planned = this.planCommit(session, view, block, coresByBase);
+            const planned = this.planCommit(session, view, block, coresByBase, applied.state);
             if ('problem' in planned)
                 problems.set(block.blockId, planned.problem);
             else
                 plans.push(block);
         }
-        if (problems.size > 0) {
-            const lines = created.map((block) => {
-                const problem = problems.get(block.blockId);
-                return problem === undefined
-                    ? `- ${block.blockId} ${block.startRef}–${block.endRef}: NOT committed — batch rejected because another block in this call could not be committed`
-                    : `- ${block.blockId} ${block.startRef}–${block.endRef}: NOT committed — ${problem}`;
-            });
-            return {
-                ok: false,
-                text: `Compressed 0 range(s):\n${lines.join('\n')}\nNo durable replacement was written and the kernel state was not saved; retry with ranges that cover each message completely.${warnings}${errors}`,
-            };
-        }
+        // Plan failures are per-block, not per-call. One span that splits a message
+        // (or was already folded) must not discard the spans that would commit
+        // cleanly — the previous all-or-nothing return meant a single bad range
+        // turned the whole call into "Compressed 0 range(s)" and left the model to
+        // retry everything by hand.
         const committed = [];
         const partialIds = new Set();
         for (const block of plans) {
@@ -522,7 +515,7 @@ export class CompactionEngine {
                 // the log tail. A span planned before those writes can therefore cite a
                 // node set that no longer matches what dsh will shadow, which is the
                 // batch-order half of the "not compressible" failures.
-                const plan = this.planCommit(session, view, block, coresByBase);
+                const plan = this.planCommit(session, view, block, coresByBase, applied.state);
                 if ('problem' in plan)
                     throw new Error(plan.problem);
                 total = plan.segments.length;
@@ -556,7 +549,7 @@ export class CompactionEngine {
                     // compress call will plan them again. Retry the remainder once — an
                     // append failure is usually transient — and report it if it is not.
                     try {
-                        const repair = this.planCommit(session, view, block, coresByBase);
+                        const repair = this.planCommit(session, view, block, coresByBase, applied.state);
                         if (!('problem' in repair)) {
                             for (const [index, segment] of repair.segments.entries()) {
                                 session.append('user/message', {
@@ -609,7 +602,13 @@ export class CompactionEngine {
         const body = allCommitted
             ? `Compressed ${created.length} range(s):\n${lines.join('\n')}${usage}`
             : `Compressed ${committed.length - partialIds.size} of ${created.length} range(s):\n${lines.join('\n')}${usage}`;
-        return { ok: allCommitted && errors.length === 0, text: `${body}${warnings}${errors}` };
+        const skipped = created.length - (committed.length - partialIds.size);
+        const footer = committed.length === 0
+            ? '\nNo durable replacement was written and the kernel state was not saved; retry with ranges that cover each message completely.'
+            : skipped > 0
+                ? `\n${skipped} range(s) were skipped; their messages stay compressible for a later call.`
+                : '';
+        return { ok: allCommitted && errors.length === 0, text: `${body}${footer}${warnings}${errors}` };
     }
     /**
      * Validate one durable replacement without writing it.
@@ -629,7 +628,7 @@ export class CompactionEngine {
      * still opens only on messages it covers, and every segment cites exactly the
      * nodes it will shadow.
      */
-    planCommit(session, view, block, coresByBase) {
+    planCommit(session, view, block, coresByBase, state) {
         const coveredIds = new Set(block.effectiveMessageIds);
         const coveredBases = new Set();
         for (const id of coveredIds)
@@ -702,8 +701,15 @@ export class CompactionEngine {
             if (expected !== undefined) {
                 const missing = [...expected].filter((id) => !coveredIds.has(id));
                 if (missing.length > 0) {
+                    // The core ids are opaque (`<messageId>#<contentIndex>`); print their
+                    // message refs too so the next call can copy a usable range instead of
+                    // guessing which sibling it left out.
+                    const refs = missing
+                        .map((id) => state?.messageRefs.byRaw[id])
+                        .filter((ref) => ref !== undefined);
+                    const hint = refs.length === missing.length ? ` — refs ${refs.join(', ')}` : '';
                     return {
-                        problem: `the span contains ${base} but this block covers only part of its content (missing ${missing.join(', ')}); compress a range that covers every content block of ${base}`,
+                        problem: `the span contains ${base} but this block covers only part of its content (missing ${missing.join(', ')})${hint}; compress a range that covers every content block of ${base}`,
                     };
                 }
             }
@@ -731,7 +737,18 @@ export class CompactionEngine {
         const blocks = applied.blocks
             .filter((block) => before.has(block.blockId) || kept.has(block.blockId))
             .map((block) => failedConsumed.has(block.blockId) && !committedConsumed.has(block.blockId) ? { ...block, active: true } : block);
-        return { ...applied, blocks };
+        // The kernel already counted every block it created, including the ones
+        // that were skipped here; un-count them so `stats` describes what the log
+        // actually contains (and so the saved state log line is truthful).
+        const skippedTokens = failed.reduce((sum, block) => sum + block.compressedTokens, 0);
+        const stats = failed.length === 0
+            ? applied.stats
+            : {
+                ...applied.stats,
+                tokensCompressed: Math.max(0, applied.stats.tokensCompressed - skippedTokens),
+                compressionCount: Math.max(0, applied.stats.compressionCount - failed.length),
+            };
+        return { ...applied, blocks, stats };
     }
     /** Cache-safe decompress: return the folded originals as tool output. */
     decompress(session, rawBlockId, full = false) {
@@ -751,6 +768,137 @@ export class CompactionEngine {
         if (collected.count === 0)
             return `decompress: ${block.blockId} covers no messages in the current log.`;
         return `decompress ${block.blockId} (${collected.count} item(s), tier ${block.tier}${full ? ', all tiers' : ', one tier up'}):\n\n${collected.text}`;
+    }
+    /**
+     * The ranges a nudge may advertise.
+     *
+     * The kernel recommends core-level spans (one per content block), while
+     * `compress` commits against dsh's positional surface: a replacement can only
+     * shadow a contiguous run of whole messages, and only while those messages
+     * are still visible. Rendering the kernel list verbatim therefore advertises
+     * spans the commit path has to reject: an endpoint that splits an assistant
+     * message into its text/reasoning cores, or a span an earlier fold already
+     * shadowed. Align every endpoint to its whole message, drop what the surface
+     * cannot show, and suppress a nudge that has nothing left to offer.
+     */
+    nudgeDecision(session, synced) {
+        const decision = synced.decision;
+        if (decision === null)
+            return null;
+        const visible = new Set(session.surface.nodes);
+        // Expanding an endpoint to its whole message may pull in a protected
+        // sibling core (the preserve-recent window can start mid-message). Those
+        // spans are dropped instead of being advertised and then split at commit.
+        const blockedSeqs = new Set();
+        for (const range of decision.protectedRanges ?? []) {
+            for (const id of this.rangeCoreIds(range, synced.state, synced.view)) {
+                const seq = synced.view.seqOf.get(id);
+                if (seq !== undefined)
+                    blockedSeqs.add(seq);
+            }
+        }
+        const bounds = this.messageBounds(synced.view);
+        const ranges = [];
+        for (const candidate of decision.compressibleRanges) {
+            const aligned = this.alignRange(candidate, synced.state, synced.view, bounds);
+            if (aligned === null)
+                continue;
+            if (this.rangeOnSurface(aligned, synced.view, visible, blockedSeqs))
+                ranges.push(aligned);
+        }
+        const protectedRanges = (decision.protectedRanges ?? []).filter((range) => this.rangeOnSurface(range, synced.view, visible, new Set()));
+        const tierWork = (decision.tierTargetBlocks?.length ?? 0) > 0;
+        if (ranges.length === 0 && decision.shouldInject && !tierWork) {
+            return { ...decision, shouldInject: false, compressibleRanges: [], protectedRanges };
+        }
+        return { ...decision, compressibleRanges: ranges, protectedRanges };
+    }
+    /** Kernel core ids behind one advertised span, in message order. */
+    rangeCoreIds(range, state, view) {
+        const start = range.startIndex;
+        const end = range.endIndex;
+        if (typeof start === 'number' && typeof end === 'number' && end >= start) {
+            const ids = [];
+            for (let index = start; index <= end; index += 1) {
+                const message = view.messages[index];
+                if (message !== undefined)
+                    ids.push(message.id);
+            }
+            return ids;
+        }
+        const startRaw = state.messageRefs.byRef[range.startRef];
+        const endRaw = state.messageRefs.byRef[range.endRef];
+        return startRaw === undefined || endRaw === undefined ? [] : [startRaw, endRaw];
+    }
+    /** First and last core index of each dsh message, in one pass. */
+    messageBounds(view) {
+        const bounds = new Map();
+        for (let index = 0; index < view.messages.length; index += 1) {
+            const message = view.messages[index];
+            if (message === undefined)
+                continue;
+            const base = baseIdOf(message.id);
+            const known = bounds.get(base);
+            if (known === undefined)
+                bounds.set(base, { start: index, end: index });
+            else
+                known.end = index;
+        }
+        return bounds;
+    }
+    /**
+     * Widen a core-level span to the whole messages its endpoints belong to.
+     *
+     * A dsh event is one message with `text`, `reasoning` and `tool-call` cores;
+     * the kernel numbers them separately. Committing a fold that covers only some
+     * cores would drop the siblings without summarizing them, so the range has to
+     * start at the first core of its first message and end at the last core of
+     * its last one. Returns null when an endpoint has no live message.
+     */
+    alignRange(range, state, view, bounds) {
+        const startRaw = state.messageRefs.byRef[range.startRef];
+        const endRaw = state.messageRefs.byRef[range.endRef];
+        if (startRaw === undefined || endRaw === undefined)
+            return null;
+        const startBound = bounds.get(baseIdOf(startRaw));
+        const endBound = bounds.get(baseIdOf(endRaw));
+        if (startBound === undefined || endBound === undefined)
+            return null;
+        const startIndex = startBound.start;
+        const endIndex = endBound.end;
+        if (endIndex < startIndex)
+            return null;
+        const first = view.messages[startIndex];
+        const last = view.messages[endIndex];
+        if (first === undefined || last === undefined)
+            return null;
+        const startRef = state.messageRefs.byRaw[first.id];
+        const endRef = state.messageRefs.byRaw[last.id];
+        if (startRef === undefined || endRef === undefined)
+            return null;
+        return { ...range, startRef, endRef, startIndex, endIndex, count: endIndex - startIndex + 1 };
+    }
+    /** True when every message of the span is a node dsh can still shadow. */
+    rangeOnSurface(range, view, visible, blockedSeqs) {
+        const start = range.startIndex;
+        const end = range.endIndex;
+        // Hand-built or normalized ranges may carry no index; they were advertised
+        // by the kernel itself, so keep them rather than hide a real span.
+        if (start === undefined || end === undefined)
+            return true;
+        if (end < start)
+            return false;
+        for (let index = start; index <= end; index += 1) {
+            const message = view.messages[index];
+            if (message === undefined)
+                return false;
+            const seq = view.seqOf.get(message.id);
+            if (seq === undefined || !visible.has(seq))
+                return false;
+            if (blockedSeqs.has(seq))
+                return false;
+        }
+        return true;
     }
     /**
      * The refs the model may fold right now.

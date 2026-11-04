@@ -228,12 +228,12 @@ npm test                    # node --test tests/*.test.mjs
 - `modelContextLimit` 可配置；未显式配置时插件读 `session.requestContext().contextWindow`，路由未通告窗口时回退 1M。显式配置的值始终优先，不会被路由通告的更大窗口覆盖。
 - 压缩区间只能落在 `m00002` 之后（内核保留第一段 user 开场），以及 `preserveRecentMessages` / `preserveRecentTokens` 之外——默认最后 3 条消息、5000 token 不许折，所以“刚贴进来的长文”要等下一轮才进区间。这个保护现在对显式 `compress` 也生效：内核自己计算保护 ref，插件不再传错类型的 `protectedMessageIds`。
 - 单区间字符数要过内核的 `compress.minCompressRange`（默认 5000 字符），太短会直接被拒；小会话压不动是内核策略，不是插件 bug。
-- `commit` 会先规划整批替换：任何区间若“遮蔽区间里出现该 block 未覆盖的可见消息”或“只覆盖一条多 block 事件的一部分”，整批拒绝且不写 durable replacement、不保存内核状态，不会留下一个假 active block。宁可少折，不做半折叠。
+- `commit` 会先规划整批替换，但按块独立提交：某个区间若“遮蔽区间里出现该 block 未覆盖的可见消息”或“只覆盖一条多 block 事件的一部分”，这一块会被跳过并在结果里列出原因（含缺失 core 的 ref），同一批里合法的区间照常写入；只有所有块都失败时才不写 durable replacement、不保存内核状态，不会留下一个假 active block。
 - 和 `billion-context` 同时加载时两边工具同名（`compress` / `decompress` / `acp_status`），只能留一个。
-- 状态 JSON 现在会逐项校验 block 与 contentStore：损坏的 block 会被丢弃，坏掉的 contentStore 回退为空；但这不是加密或版本迁移机制，跨大版本升级仍建议手动清一次状态目录。
+- 状态 JSON 现在会逐项校验 block 与 contentStore：损坏的 block 会被丢弃，坏掉的 contentStore 回退为空；但这不是加密或版本迁移机制，跨大版本升级仍建议手动清一次状态目录。写入一份空 LSM（`blocks=0`）覆盖已有折叠时会被拒绝，并在旁边留下 `.refuse-<时间戳>` 备份；读不出来的状态文件会先复制成 `.corrupt-<时间戳>` 再重建。默认只在块数/折叠统计变化时打印一行 `[bili-compaction][state] ...`，设 `DSH_BILI_COMPACTION_STATE_LOG=1` 可打印每次 load/save。
 - `acp_reset` 清空 LSM 时会扫描日志里已有的 `acp_block_bN` checkpoint，把 `nextBlockId` 推到最大值之后，避免重置后再次生成重复的 message id。
 
 ## 验证状态
 
-- `npm test`：17 个用例，覆盖 store 归一化/损坏回退、原生压缩行剥离与 preset 服务守卫（压力压缩返回 `null`、溢出恢复委派原生实现、`toolResultPruner` 不被改写）、`ManualCompactionError` 解析、preset context 兜底、append-origin 视图与 ref 编号、durable replace 提交、未知 ref 拒绝、多 block 事件的半覆盖拒绝、失败提交不落 active block、显式 compress 不吃保护尾、动态窗口识别、只读状态不推进 nudge、reset 不重用 block id、`acp_status` 隐藏已被 surface 折掉的区间，以及「给出的 ref 必须能被 `compress` 当场接受」的回归。
+- `npm test`：41 个用例，覆盖 store 归一化/损坏回退/空状态保护与状态日志、原生压缩行剥离与 preset 服务守卫（压力压缩返回 `null`、溢出恢复委派原生实现、`toolResultPruner` 不被改写）、`ManualCompactionError` 解析、preset context 兜底、append-origin 视图与 ref 编号、durable replace 提交、未知 ref 拒绝、多 block 事件的半覆盖拒绝与「坏块跳过、好块照常提交」、失败提交不落 active block、显式 compress 不吃保护尾、动态窗口识别、只读状态不推进 nudge、reset 不重用 block id、`acp_status` 隐藏已被 surface 折掉的区间，以及「nudge 给出的 ref 必须整条消息对齐、能被 `compress` 当场接受」的回归。
 - 真实 dsh 会话（headless profile，`preserveRecentMessages: 0`）：`acp_status` → `compress` 一次成功，dsh 日志落下 `surfaceOp: 'replace'`，token meter 随之下降；插件状态文件里出现 `b1 m00009–m00017 3374 tokens`。

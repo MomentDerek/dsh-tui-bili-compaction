@@ -97,12 +97,12 @@ export declare class CompactionEngine {
     /**
      * Apply a `compress` tool call.
      *
-     * Every newly created block becomes one durable surface replacement. The whole
-     * batch is planned before the first append: if any block would split a dsh
-     * event, span an uncovered message, or otherwise cannot be represented, the
-     * call is rejected without writing a replacement and without persisting the
-     * kernel state. A failed commit must never leave an active block that covers
-     * messages still visible on dsh's surface.
+     * Every newly created block becomes one durable surface replacement. A block
+     * that cannot be represented (it splits a dsh event, covers no visible
+     * message, or cites a span an earlier fold already shadowed) is reported and
+     * skipped; the rest of the batch still commits. Only when nothing lands is the
+     * kernel state left unsaved, so a failed commit can never leave an active block
+     * that covers messages still visible on dsh's surface.
      */
     compress(session: DshSessionLike, rawArgs: unknown, measurement?: DshTokenMeasurement): CompressOutcome;
     /**
@@ -132,6 +132,35 @@ export declare class CompactionEngine {
     private stateAfterCommitFailure;
     /** Cache-safe decompress: return the folded originals as tool output. */
     decompress(session: DshSessionLike, rawBlockId: unknown, full?: boolean): string;
+    /**
+     * The ranges a nudge may advertise.
+     *
+     * The kernel recommends core-level spans (one per content block), while
+     * `compress` commits against dsh's positional surface: a replacement can only
+     * shadow a contiguous run of whole messages, and only while those messages
+     * are still visible. Rendering the kernel list verbatim therefore advertises
+     * spans the commit path has to reject: an endpoint that splits an assistant
+     * message into its text/reasoning cores, or a span an earlier fold already
+     * shadowed. Align every endpoint to its whole message, drop what the surface
+     * cannot show, and suppress a nudge that has nothing left to offer.
+     */
+    private nudgeDecision;
+    /** Kernel core ids behind one advertised span, in message order. */
+    private rangeCoreIds;
+    /** First and last core index of each dsh message, in one pass. */
+    private messageBounds;
+    /**
+     * Widen a core-level span to the whole messages its endpoints belong to.
+     *
+     * A dsh event is one message with `text`, `reasoning` and `tool-call` cores;
+     * the kernel numbers them separately. Committing a fold that covers only some
+     * cores would drop the siblings without summarizing them, so the range has to
+     * start at the first core of its first message and end at the last core of
+     * its last one. Returns null when an endpoint has no live message.
+     */
+    private alignRange;
+    /** True when every message of the span is a node dsh can still shadow. */
+    private rangeOnSurface;
     /**
      * The refs the model may fold right now.
      *

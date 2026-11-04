@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -100,6 +100,24 @@ function temporaryDir() {
   return mkdtempSync(join(tmpdir(), 'bili-compaction-test-'))
 }
 
+/** A block that survives `normalizeBlock`, for store-level tests. */
+function persistedBlock(blockId) {
+  return {
+    blockId,
+    runId: 'r00001',
+    summary: 'a durable summary of the folded range',
+    tier: 1,
+    generation: 'young',
+    directMessageIds: ['u1#0'],
+    effectiveMessageIds: ['u1#0'],
+    directBlockIds: [],
+    compressedTokens: 1200,
+    createdAt: 1,
+    survivedCount: 0,
+    active: true,
+  }
+}
+
 test('session store normalizes valid state and discards malformed entries', () => {
   const dir = temporaryDir()
   try {
@@ -144,6 +162,63 @@ test('session store normalizes valid state and discards malformed entries', () =
     store.reset('abc')
     const fresh = store.load('abc')
     assert.deepEqual(fresh.state.blocks, [])
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('session store refuses an empty state over a populated one and logs the folds', () => {
+  const dir = temporaryDir()
+  try {
+    const events = []
+    const store = new SessionStore(dir, (event) => events.push(event))
+    const state = createInitialState()
+    state.blocks.push(persistedBlock('b00001'))
+    state.messageRefs = { byRaw: { 'u1#0': 'm00001' }, byRef: { m00001: 'u1#0' } }
+    state.stats = { ...state.stats, compressionCount: 1, tokensCompressed: 1200 }
+    state.nextBlockId = 2
+    store.save('abc', { version: 1, state, contentStore: createContentStore() })
+
+    const saved = events.find((event) => event.action === 'save')
+    assert.ok(saved, JSON.stringify(events))
+    assert.equal(saved.blocks, 1)
+    assert.equal(saved.active, 1)
+    assert.equal(saved.refs, 1)
+    assert.equal(saved.folded, 1)
+    assert.equal(saved.tokens, 1200)
+    assert.equal(saved.sessionId, 'abc')
+
+    // A fresh kernel state (the resume/fork failure) must not wipe the folds.
+    store.save('abc', { version: 1, state: createInitialState(), contentStore: createContentStore() })
+    assert.equal(new SessionStore(dir).load('abc').state.blocks.length, 1)
+    assert.equal(readdirSync(dir).filter((name) => name.includes('.refuse-')).length, 1)
+    const refused = events.filter((event) => event.action === 'refuse-empty')
+    assert.equal(refused.length, 1)
+    assert.equal(refused[0].blocks, 0)
+    assert.match(refused[0].detail ?? '', /refused to overwrite/)
+
+    // reset is the explicit escape hatch.
+    store.reset('abc')
+    assert.deepEqual(new SessionStore(dir).load('abc').state.blocks, [])
+    assert.equal(events.at(-1).action, 'reset')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('session store reports and backs up a corrupt state file', () => {
+  const dir = temporaryDir()
+  try {
+    const events = []
+    const store = new SessionStore(dir, (event) => events.push(event))
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(store.path('abc'), '{ not json')
+    const loaded = store.load('abc')
+    assert.deepEqual(loaded.state.blocks, [])
+    const corrupt = events.filter((event) => event.action === 'corrupt')
+    assert.equal(corrupt.length, 1)
+    assert.match(corrupt[0].detail ?? '', /unreadable/)
+    assert.equal(readdirSync(dir).filter((name) => name.includes('.corrupt-')).length, 1)
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
@@ -610,6 +685,59 @@ test('status hides ranges another compactor already folded', () => {
   }
 })
 
+test('nudge ranges cover whole messages so every advertised ref can commit', () => {
+  const dir = temporaryDir()
+  try {
+    const session = new FakeSession()
+    session.push(userMessage('u1', filler(6000)))
+    session.push({
+      id: 'a1',
+      role: 'assistant',
+      content: [
+        { type: 'text', text: filler(6000) },
+        { type: 'reasoning', text: filler(6000) },
+      ],
+      source: { kind: 'model', provider: 'test', model: 'test-model' },
+    })
+    session.push(userMessage('u2', filler(6000)))
+
+    const options = resolveOptions({
+      storageDir: dir,
+      modelContextLimit: 40_000,
+      kernel: { preserveRecentMessages: 0, preserveRecentTokens: 0 },
+    })
+    const store = new SessionStore(dir)
+    const engine = new CompactionEngine(options, store)
+    const refreshed = engine.refresh(session, { totalTokens: 30_000, surfaceTokens: 30_000, nodes: [] })
+    assert.equal(refreshed.decision?.shouldInject, true)
+    const ranges = refreshed.decision?.compressibleRanges ?? []
+    assert.ok(ranges.length > 0, 'expected at least one advertised range')
+
+    // a1 owns m00002 (text) and m00003 (reasoning). The kernel advertises the
+    // text core; the nudge has to widen it to m00001–m00004, otherwise the
+    // model copies m00002 and planCommit rejects the half-message span.
+    const covering = ranges.find((range) => range.startIndex <= 1 && range.endIndex >= 2)
+    assert.ok(covering, JSON.stringify(ranges))
+    assert.equal(covering.startRef, 'm00001')
+    assert.equal(covering.endRef, 'm00003')
+
+    // Everything the nudge printed must commit as-is.
+    const folded = engine.compress(session, {
+      content: JSON.stringify(
+        ranges.map((range, index) => ({
+          startId: range.startRef,
+          endId: range.endRef,
+          summary: `## Advertised range ${index}\nThis summary covers the whole span the nudge advertised, so it commits.`,
+        })),
+      ),
+    })
+    assert.equal(folded.ok, true, folded.text)
+    assert.equal(store.load(session.id).state.blocks.length, ranges.length)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('a partial multi-block range is rejected before any durable write', () => {
   const dir = temporaryDir()
   try {
@@ -667,6 +795,57 @@ test('a partial multi-block range is rejected before any durable write', () => {
     assert.deepEqual(replacements[0].surfaceOp, { op: 'replace', startSeq: 1, endSeq: 1 })
     assert.deepEqual(session.surfaceNodes, [0, 3, 2])
     assert.equal(engine.decompress(session, replacements[0].data.source.blockId).includes('lorem ipsum'), true)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('a range that splits a message is skipped while the rest of the batch commits', () => {
+  const dir = temporaryDir()
+  try {
+    const session = new FakeSession()
+    session.push(userMessage('u1', filler(6000)))
+    session.push({
+      id: 'a1',
+      role: 'assistant',
+      content: [
+        { type: 'text', text: filler(6000) },
+        { type: 'reasoning', text: filler(6000) },
+      ],
+      source: { kind: 'model', provider: 'test', model: 'test-model' },
+    })
+    session.push(userMessage('u2', filler(6000)))
+
+    const options = resolveOptions({
+      storageDir: dir,
+      modelContextLimit: 40_000,
+      kernel: { preserveRecentMessages: 0, preserveRecentTokens: 0 },
+    })
+    const store = new SessionStore(dir)
+    const engine = new CompactionEngine(options, store)
+    engine.refresh(session, { totalTokens: 30_000, surfaceTokens: 30_000, nodes: [] })
+
+    const result = engine.compress(session, {
+      content: JSON.stringify([
+        { startId: 'm00001', endId: 'm00001', summary: '## Whole message\nThis range covers u1 completely and must land.' },
+        { startId: 'm00002', endId: 'm00002', summary: '## Half a message\nThis range covers only the text core of a1.' },
+      ]),
+    })
+    assert.equal(result.ok, false)
+    assert.match(result.text, /Compressed 1 of 2 range\(s\)/)
+    assert.match(result.text, /covers only part of its content/)
+    assert.match(result.text, /refs m00003/)
+    assert.match(result.text, /1 range\(s\) were skipped/)
+
+    // Only u1 was shadowed; a1 and u2 are still on the surface.
+    assert.deepEqual(session.surfaceNodes, [3, 1, 2])
+    const saved = store.load(session.id).state
+    assert.deepEqual(saved.blocks.map((block) => [block.blockId, block.startRef, block.endRef, block.active]), [
+      ['b1', 'm00001', 'm00001', true],
+    ])
+    // The skipped block must not be counted in the stats the state now claims.
+    assert.equal(saved.stats.compressionCount, 1)
+    assert.equal(saved.stats.tokensCompressed, 1500)
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

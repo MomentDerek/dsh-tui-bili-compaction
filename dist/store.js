@@ -1,9 +1,42 @@
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { createContentStore, createInitialState } from './kernel.js';
 const STORE_VERSION = 1;
+/** Set to `1` to print every load/save, not just the ones that change state. */
+const STATE_LOG_ENV = 'DSH_BILI_COMPACTION_STATE_LOG';
+function summaryOf(session) {
+    // Count only blocks a load would keep (`normalizeBlock` drops malformed
+    // ones), but do not rebuild the whole state: this runs on every save.
+    const state = session.state;
+    let blocks = 0;
+    let active = 0;
+    for (const block of Array.isArray(state.blocks) ? state.blocks : []) {
+        if (!normalizeBlock(block))
+            continue;
+        blocks += 1;
+        if (block.active === true)
+            active += 1;
+    }
+    const refs = isRecord(state.messageRefs) && isRecord(state.messageRefs.byRef) ? Object.keys(state.messageRefs.byRef).length : 0;
+    const stats = isRecord(state.stats) ? state.stats : undefined;
+    return {
+        blocks,
+        active,
+        refs,
+        folded: stats !== undefined && finite(stats['compressionCount']) ? stats['compressionCount'] : 0,
+        tokens: stats !== undefined && finite(stats['tokensCompressed']) ? stats['tokensCompressed'] : 0,
+    };
+}
+function verboseStateLog() {
+    const value = process.env[STATE_LOG_ENV];
+    return value === '1' || value === 'true';
+}
+function formatStoreLog(event) {
+    const detail = event.detail === undefined ? '' : ` ${event.detail}`;
+    return `[bili-compaction][state] ${event.action} session=${event.sessionId.slice(0, 8)} blocks=${event.blocks} active=${event.active} refs=${event.refs} folded=${event.folded} tokens=${event.tokens}${detail}`;
+}
 export function defaultStorageDir() {
     const localAppData = process.env['LOCALAPPDATA'];
     if (process.platform === 'win32' && typeof localAppData === 'string' && localAppData.length > 0) {
@@ -163,9 +196,11 @@ function normalizeState(value) {
 }
 export class SessionStore {
     dir;
+    log;
     cache = new Map();
-    constructor(dir) {
+    constructor(dir, log) {
         this.dir = dir !== undefined && dir.length > 0 ? dir : defaultStorageDir();
+        this.log = log;
     }
     path(sessionId) {
         return join(this.dir, `${fileStem(sessionId)}.json`);
@@ -178,17 +213,29 @@ export class SessionStore {
         let loaded;
         if (!existsSync(file)) {
             loaded = emptySession();
+            this.emit({ action: 'load', sessionId, file, ...summaryOf(loaded), detail: 'no state file yet' }, false);
         }
         else {
             try {
                 const parsed = JSON.parse(readFileSync(file, 'utf8'));
                 loaded = this.normalize(parsed);
+                const summary = summaryOf(loaded);
+                this.emit({ action: 'load', sessionId, file, ...summary }, summary.blocks > 0);
             }
-            catch {
-                // A corrupt or older shape must never take the session down: start the
-                // LSM over. dsh's own log still holds every message, so the only loss
-                // is the compression bookkeeping.
+            catch (error) {
+                // A corrupt file must not take the session down, but its bytes are the
+                // only evidence of what the LSM believed: keep a copy before starting
+                // over, and say so — this used to reset silently.
+                const why = error instanceof Error ? error.message : String(error);
+                const backup = this.backup(file, 'corrupt');
                 loaded = emptySession();
+                this.emit({
+                    action: 'corrupt',
+                    sessionId,
+                    file,
+                    ...summaryOf(loaded),
+                    detail: `unreadable (${why}); copy kept at ${backup ?? file}`,
+                }, true, true);
             }
         }
         this.cache.set(sessionId, loaded);
@@ -203,27 +250,100 @@ export class SessionStore {
             contentStore: normalizeContentStore(parsed['contentStore']),
         };
     }
-    save(sessionId, value) {
+    /**
+     * Persist one session state.
+     *
+     * A `blocks === 0` state written over one that had blocks means the kernel
+     * lost its LSM (the resume/fork path can hand back a fresh state while the
+     * log is intact). The file on disk is then the only copy of the folds, so it
+     * is backed up and the write is refused instead of letting a stale empty view
+     * erase it. `reset` opts in with `allowEmpty`.
+     */
+    save(sessionId, value, options = {}) {
+        const file = this.path(sessionId);
+        const previous = this.cache.get(sessionId) ?? this.peek(sessionId);
+        // Count what the file will actually mean after a load, not the raw payload:
+        // malformed blocks are discarded by `normalize`, and a payload of only
+        // malformed blocks must not look like a real state worth protecting.
+        const before = previous === undefined ? undefined : summaryOf(previous);
+        const next = summaryOf(value);
+        if (options.allowEmpty !== true && next.blocks === 0 && before !== undefined && before.blocks > 0) {
+            const backup = this.backup(file, 'refuse');
+            this.emit({
+                action: 'refuse-empty',
+                sessionId,
+                file,
+                ...next,
+                detail: `previous blocks=${before.blocks} active=${before.active} folded=${before.folded}; refused to overwrite (copy kept at ${backup ?? file})`,
+            }, true, true);
+            return;
+        }
         this.cache.set(sessionId, value);
         mkdirSync(this.dir, { recursive: true });
-        const target = this.path(sessionId);
-        const temp = `${target}.${process.pid}.tmp`;
+        const temp = `${file}.${process.pid}.tmp`;
         writeFileSync(temp, JSON.stringify(value), 'utf8');
         try {
-            renameWithRetry(temp, target);
+            renameWithRetry(temp, file);
         }
         catch (error) {
             rmSync(temp, { force: true });
             throw error;
         }
+        // Refs and active flags churn on every ordinary turn; only a change in the
+        // fold bookkeeping itself is worth a line. `DSH_BILI_COMPACTION_STATE_LOG=1`
+        // prints the rest.
+        const notable = before === undefined
+            ? next.blocks > 0
+            : before.blocks !== next.blocks || before.folded !== next.folded || before.tokens !== next.tokens;
+        this.emit({ action: options.action ?? 'save', sessionId, file, ...next, detail: options.detail }, notable);
     }
     reset(sessionId, nextBlockId) {
+        const previous = this.cache.get(sessionId) ?? this.peek(sessionId);
         const fresh = emptySession();
         if (nextBlockId !== undefined && nextBlockId > fresh.state.nextBlockId) {
             fresh.state.nextBlockId = nextBlockId;
         }
-        this.save(sessionId, fresh);
+        const detail = previous === undefined ? 'fresh session' : `replaced blocks=${summaryOf(previous).blocks}`;
+        this.save(sessionId, fresh, { allowEmpty: true, action: 'reset', detail });
         return fresh;
+    }
+    /** Read a state file for comparison without caching or reporting it. */
+    peek(sessionId) {
+        try {
+            const file = this.path(sessionId);
+            if (!existsSync(file))
+                return undefined;
+            return this.normalize(JSON.parse(readFileSync(file, 'utf8')));
+        }
+        catch {
+            return undefined;
+        }
+    }
+    /** Copy a file aside before it is replaced or abandoned. Best effort. */
+    backup(file, kind) {
+        if (!existsSync(file))
+            return undefined;
+        const target = `${file}.${kind}-${Date.now()}`;
+        try {
+            copyFileSync(file, target);
+            return target;
+        }
+        catch {
+            return undefined;
+        }
+    }
+    emit(event, notable, warn = false) {
+        if (this.log !== undefined) {
+            this.log(event);
+            return;
+        }
+        if (!notable && !verboseStateLog())
+            return;
+        const line = formatStoreLog(event);
+        if (warn)
+            console.warn(line);
+        else
+            console.log(line);
     }
 }
 //# sourceMappingURL=store.js.map
