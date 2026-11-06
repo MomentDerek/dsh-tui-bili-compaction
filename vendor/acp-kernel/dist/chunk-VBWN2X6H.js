@@ -399,10 +399,11 @@ function formatBlockMap(spans) {
   const prefix = hidden > 0 ? `\u2026+${hidden} older \xB7 ` : "";
   return `Active blocks (${spans.length}): ${prefix}${items.join(" \xB7 ")}`;
 }
-function formatRanges(compressible, protectedRanges) {
+function formatRanges(compressible, protectedRanges, options) {
   if (compressible.length === 0 && protectedRanges.length === 0) {
     return "[No specific ranges detected \u2014 compress any consumed content.]";
   }
+  const hideProtectedOnly = options?.hideProtectedOnly === true;
   const refNum = (ref) => {
     const m = ref.match(/\d+/);
     return m ? parseInt(m[0], 10) : 0;
@@ -464,6 +465,13 @@ function formatRanges(compressible, protectedRanges) {
       last.tokens += e.tokens;
       last.userMsgs += e.userMsgs;
       last.compressibleTokens += e.compressibleTokens;
+      if (e.compressibleCount > 0) {
+        const compressibleTotal = last.compressibleCount + e.compressibleCount;
+        last.toolPct = Math.round(
+          ((last.toolPct ?? 0) * last.compressibleCount + (e.toolPct ?? 0) * e.compressibleCount) / compressibleTotal
+        );
+        last.textPct = 100 - last.toolPct;
+      }
       last.compressibleCount += e.compressibleCount;
       last.protectedTokens += e.protectedTokens;
       last.protectedCount += e.protectedCount;
@@ -476,19 +484,23 @@ function formatRanges(compressible, protectedRanges) {
     }
   }
   const userNote = (n) => n > 0 ? ` \xB7 ${n} user msg${n > 1 ? "s" : ""}` : "";
-  const lines = merged.map((e) => {
+  const shown = hideProtectedOnly ? merged.filter((e) => e.compressibleTokens > 0) : merged;
+  const omitted = merged.length - shown.length;
+  const lines = shown.map((e) => {
     const [lo, hi] = orderedRefPair(e.startRef, e.endRef);
     const suffix = e.dangerous && e.compressibleTokens > 0 ? "  \u26A0\uFE0F NOT recommended unless you are certain." : "";
+    const toolList = e.protectedTools.length > 0 ? `: ${e.protectedTools.join(", ")}` : "";
     if (e.protectedTokens > 0 && e.compressibleTokens === 0) {
-      return `  ${lo}\u2013${hi}  ${e.count} msgs  ${formatK(e.tokens)} [PROTECTED: ${e.protectedTools.join(", ")} \u2014 not compressible]${suffix}`;
+      return `  ${lo}\u2013${hi}  ${e.count} msgs  ${formatK(e.tokens)} [PROTECTED${toolList} \u2014 not compressible]${suffix}`;
     }
     if (e.protectedTokens > 0 && e.compressibleTokens > 0) {
-      return `  ${lo}\u2013${hi}  ${e.count} msgs  ${formatK(e.tokens)} [${formatK(e.compressibleTokens)} compressible | ${formatK(e.protectedTokens)} protected: ${e.protectedTools.join(", ")}]${userNote(e.userMsgs)}${suffix}`;
+      return `  ${lo}\u2013${hi}  ${e.count} msgs  ${formatK(e.tokens)} [${formatK(e.compressibleTokens)} compressible | ${formatK(e.protectedTokens)} protected${toolList}]${userNote(e.userMsgs)}${suffix}`;
     }
     return `  ${lo}\u2013${hi}  ${e.count} msgs  ${formatK(e.tokens)} [tool ${e.toolPct}% | text ${e.textPct}%]${userNote(e.userMsgs)}${suffix}`;
   });
-  return `Compressible ranges (${merged.length}, oldest first):
-${lines.join("\n")}`;
+  const omittedNote = omitted > 0 ? `\n  (${omitted} protected range${omitted === 1 ? "" : "s"} omitted \u2014 not compressible)` : "";
+  const body = lines.length > 0 ? `\n${lines.join("\n")}` : "";
+  return `Compressible ranges (${shown.length}, oldest first):${body}${omittedNote}`;
 }
 var DEFAULT_T2_GUIDANCE = `Your tier-1 compression summaries have accumulated. Distill them into a single denser tier-2 summary. Use block IDs as boundaries (startId and endId as bN). Any raw (uncompressed) messages sitting between the boundary blocks are absorbed into the tier-2 block as well \u2014 apply HOW TO COMPRESS to those raw messages and the TIER 2 distillation rules to the existing summaries, so the whole span is covered and nothing is lost.`;
 var DEFAULT_T3_GUIDANCE = `Your tier-2 compression summaries have accumulated. Condense them further into a tier-3 ultra-condensed summary. Use block IDs as boundaries (startId and endId as bN). Any raw (uncompressed) messages sitting between the boundary blocks are absorbed into the tier-3 block as well \u2014 apply HOW TO COMPRESS to those raw messages and the TIER 3 condensation rules to the existing summaries, so the whole span is covered and nothing is lost.`;
@@ -507,7 +519,8 @@ function renderNudgeText(decision, prompts = defaultPrompts, sections = {}, prot
   const breakdownStr = formatBreakdown(decision.contextBreakdown);
   const rangesStr = formatRanges(
     decision.compressibleRanges,
-    decision.protectedRanges ?? []
+    decision.protectedRanges ?? [],
+    { hideProtectedOnly: true }
   );
   const blockMapStr = formatBlockMap(decision.activeBlockSpans ?? []);
   const laneNote = protocol === "anthropic" ? ANTHROPIC_LANE_NOTE : null;

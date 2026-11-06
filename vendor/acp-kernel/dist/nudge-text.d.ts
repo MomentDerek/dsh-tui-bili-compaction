@@ -16,7 +16,12 @@ export interface RenderedNudge {
     voice: NudgeVoice;
     text: string;
 }
-export declare function formatRanges(compressible: CompressibleRange[], protectedRanges: ProtectedRange[]): string;
+export interface FormatRangesOptions {
+    /** Render only ranges that still have compressible content and footnote the
+     *  protected-only groups instead of listing each one. */
+    hideProtectedOnly?: boolean;
+}
+export declare function formatRanges(compressible: CompressibleRange[], protectedRanges: ProtectedRange[], options?: FormatRangesOptions): string;
 /** #2302 root-cause fix, distilled to a STATIC reminder. The nudge used to
  *  hand the model a LIST of recommended ranges plus a batching hint — and the
  *  model digests the list in groups, one compress call per group. Each separate
